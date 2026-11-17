@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="bgGrad" x1="16" y1="8" x2="112" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2D8CFF"/>
+      <stop offset="55%" stop-color="#1768D1"/>
+      <stop offset="100%" stop-color="#0E4999"/>
+    </linearGradient>
+    <linearGradient id="glassShine" x1="64" y1="4" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- macOS Squircle Base -->
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#bgGrad)"/>
+  <rect x="5" y="5" width="118" height="118" rx="27" stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="2"/>
+  <path d="M4 32C4 16.536 16.536 4 32 4H96C111.464 4 124 16.536 124 32V54C98 62 30 62 4 54V32Z" fill="url(#glassShine)"/>
+
+  <!-- Shopping Cart Silhouette (Clean White) -->
+  <path d="M24 34H34.5C36.6 34 38.4 35.4 38.9 37.5L47.2 74.5C47.7 76.6 49.5 78 51.6 78H89.5C91.6 78 93.4 76.6 93.9 74.6L100.8 46.8C101.4 44.3 99.5 42 97 42H41"
+        stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Cart Wheels -->
+  <circle cx="54" cy="95" r="6.5" fill="#FFFFFF"/>
+  <circle cx="88" cy="95" r="6.5" fill="#FFFFFF"/>
+
+  <!-- Checklist / Verification Checkmark inside Cart -->
+  <path d="M56 58L65 67L84 48" stroke="#60BD68" stroke-width="7.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M56 58L65 67L84 48" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
