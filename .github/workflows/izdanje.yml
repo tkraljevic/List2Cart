@@ -118,15 +118,19 @@ jobs:
           bun install
           bun run build
           cargo build --release --target aarch64-apple-ios -p list2cart
-          brew install xcodegen
           bunx tauri ios init
           for dir in arm64/Release arm64/release arm64/Debug arm64/debug x86_64/Release x86_64/release x86_64/Debug x86_64/debug; do
             mkdir -p "src-tauri/gen/apple/Externals/$dir"
             cp target/aarch64-apple-ios/release/liblist2cart_lib.a "src-tauri/gen/apple/Externals/$dir/libapp.a"
           done
-          sed -i '' 's/.*tauri ios xcode-script.*/echo "Rust staticlib prebuilt"/' src-tauri/gen/apple/project.yml
+          python3 -c '
+          p = "src-tauri/gen/apple/list2cart.xcodeproj/project.pbxproj"
+          s = open(p).read()
+          import re
+          s = re.sub(r"shellScript = \"[^\"]*tauri ios xcode-script[^\"]*\";", "shellScript = \"true\";", s)
+          open(p, "w").write(s)
+          '
           cd src-tauri/gen/apple
-          xcodegen generate
           xcodebuild -project list2cart.xcodeproj -scheme list2cart_iOS -sdk iphoneos -configuration Release ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO AD_HOC_CODE_SIGNING_ALLOWED=YES SYMROOT="$PWD/build"
           APP_DIR=$(find build -name "*.app" -type d | head -n 1)
           mkdir -p Payload
