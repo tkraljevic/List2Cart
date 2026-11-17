@@ -5,7 +5,7 @@
 ## Privatnost i P2P sinkronizacija (bez vanjskih servera)
 
 - **100% lokalno i P2P:** Svi podaci (računi, cijene, trgovine, slike artikala i popisi za kupnju) spremaju se isključivo na vaš uređaj i **nikada ne odlaze na tuđe ili vanjske poslužitelje u oblaku**.
-- **Izravna P2P razmjena:** Uređaji se povezuju izravno (P2P) potvrdom 6-znamenkastog koda:
+- **Izravna P2P razmjena:** Sama sinkronizacija ovisi isključivo o korisniku i dostupnosti njegovih uređaja — uređaji razmjenjuju promjene izravno čim su oba uključena i dostupna (ili ručnim prijenosom `.list2cart` paketa kada nisu istovremeno upaljeni):
   - **S vlastitim uređajima** (npr. mobitel ↔ računalo) sinkronizirate sve svoje podatke.
   - **S članovima obitelji** dijelite samo zajedničke popise za kupnju, dok vaši osobni računi ostaju privatni.
 

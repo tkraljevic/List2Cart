@@ -643,19 +643,17 @@ function renderSync(): string {
     </div>
 
     <div class="card">
-      <div class="item-title" style="margin-bottom:6px;">Izvoz i uvoz paketa (.list2cart) ili Unraid 24/7 čvor</div>
-      <div class="row-wrap" style="margin-bottom:12px;">
+      <div class="item-title" style="margin-bottom:6px;">Izravna P2P sinkronizacija i ručni prijenos (.list2cart)</div>
+      <div class="item-sub" style="margin-bottom:12px;">
+        Podaci se nikada ne spremaju na vanjske poslužitelje. Sama sinkronizacija ovisi o vama i dostupnosti vaših uređaja — kada uređaji nisu istovremeno uključeni, promjene možete u bilo kojem trenutku prenijeti i preko <code>.list2cart</code> paketa:
+      </div>
+      <div class="row-wrap">
         <button class="btn btn-primary" id="btn-export-bundle">📤 Izvezi SVE (za moj drugi uređaj) →</button>
         <button class="btn btn-outline" id="btn-export-family-bundle">👨‍👩‍👧 Izvezi SAMO liste (za člana obitelji) →</button>
         <label class="btn btn-outline" style="cursor:pointer;">
           📥 Uvezi i spoji paket
           <input id="inp-import-bundle" type="file" accept=".json,.list2cart" style="display:none;" />
         </label>
-      </div>
-      <div class="row-wrap">
-        <input id="inp-pb-url" value="${model.pocketbaseUrl}" placeholder="http://192.168.1.100:8090" style="flex:1;" />
-        <button class="btn btn-outline" id="btn-save-pb">Spremi URL</button>
-        <button class="btn btn-subtle" id="btn-sync-pb">Sinkroniziraj s Unraid čvorom →</button>
       </div>
     </div>
   `;
