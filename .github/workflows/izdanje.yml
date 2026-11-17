@@ -16,6 +16,7 @@ permissions:
 
 jobs:
   desktop-windows:
+    if: github.event_name == 'push'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,6 +40,7 @@ jobs:
             --clobber
 
   desktop-linux:
+    if: github.event_name == 'push'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -64,6 +66,7 @@ jobs:
             --clobber
 
   mobile-android:
+    if: github.event_name == 'push'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -124,10 +127,10 @@ jobs:
             cp target/aarch64-apple-ios/release/liblist2cart_lib.a "src-tauri/gen/apple/Externals/$dir/libapp.a"
           done
           python3 -c '
+          import re
           p = "src-tauri/gen/apple/list2cart.xcodeproj/project.pbxproj"
           s = open(p).read()
-          import re
-          s = re.sub(r"shellScript = \"[^\"]*tauri ios xcode-script[^\"]*\";", "shellScript = \"true\";", s)
+          s = re.sub(r"shellScript = .*?;\n", "shellScript = \"true\";\n", s)
           open(p, "w").write(s)
           '
           cd src-tauri/gen/apple
