@@ -86,7 +86,7 @@ jobs:
           bun install
           bun run build
           bunx tauri android init
-          bunx tauri android build --apk true || (cd src-tauri/gen/android && ./gradlew assembleDebug)
+          bunx tauri android build --apk
       - name: Potpisivanje i prijenos APK u izdanje
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
