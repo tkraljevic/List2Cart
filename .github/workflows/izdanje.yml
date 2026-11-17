@@ -124,7 +124,7 @@ jobs:
             mkdir -p "src-tauri/gen/apple/Externals/$dir"
             cp target/aarch64-apple-ios/release/liblist2cart_lib.a "src-tauri/gen/apple/Externals/$dir/libapp.a"
           done
-          sed -i '' 's/npm run -- tauri ios xcode-script.*/echo "Rust staticlib prebuilt"/' src-tauri/gen/apple/project.yml
+          sed -i '' 's/.*tauri ios xcode-script.*/echo "Rust staticlib prebuilt"/' src-tauri/gen/apple/project.yml
           cd src-tauri/gen/apple
           xcodegen generate
           xcodebuild -project list2cart.xcodeproj -scheme list2cart_iOS -sdk iphoneos -configuration Release ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO AD_HOC_CODE_SIGNING_ALLOWED=YES SYMROOT="$PWD/build"
