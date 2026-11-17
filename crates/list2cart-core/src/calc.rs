@@ -3,15 +3,15 @@ use crate::models::{CartItem, ReceiptVerification, Unit};
 /// Calculates the exact line total in euro cents.
 ///
 /// - For `Unit::Kom`: `quantity * unit_price_cents`
-/// - For `Unit::Kg`: `quantity * unit_price_cents` (price is per kg)
-/// - For `Unit::G`: `(quantity / 1000.0) * unit_price_cents` (price is per kg, quantity in grams)
+/// - For `Unit::Kg` / `Unit::L`: `quantity * unit_price_cents` (price is per kg / per litre)
+/// - For `Unit::G` / `Unit::Ml`: `(quantity / 1000.0) * unit_price_cents` (price is per kg / per litre, quantity in g / ml)
 pub fn calculate_line_total_cents(quantity: f64, unit: Unit, unit_price_cents: i64) -> i64 {
     if quantity <= 0.0 || unit_price_cents <= 0 {
         return 0;
     }
     let effective_qty = match unit {
-        Unit::Kom | Unit::Kg => quantity,
-        Unit::G => quantity / 1000.0,
+        Unit::Kom | Unit::Kg | Unit::L => quantity,
+        Unit::G | Unit::Ml => quantity / 1000.0,
     };
     (effective_qty * unit_price_cents as f64).round() as i64
 }
@@ -44,6 +44,8 @@ mod tests {
     fn calculates_kilograms_and_grams_correctly() {
         assert_eq!(calculate_line_total_cents(1.25, Unit::Kg, 130), 163);
         assert_eq!(calculate_line_total_cents(500.0, Unit::G, 130), 65);
+        assert_eq!(calculate_line_total_cents(1.5, Unit::L, 200), 300);
+        assert_eq!(calculate_line_total_cents(250.0, Unit::Ml, 200), 50);
     }
 
     #[test]

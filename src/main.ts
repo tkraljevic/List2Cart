@@ -272,6 +272,8 @@ function renderKosarica(): string {
           <option value="kom">kom</option>
           <option value="kg">kg</option>
           <option value="g">g</option>
+          <option value="l">L</option>
+          <option value="ml">ml</option>
         </select>
         <input id="inp-price" placeholder="Cijena (€)" style="width:105px;" />
         <button class="btn btn-primary" id="btn-add-cart">+ Dodaj</button>
@@ -366,6 +368,8 @@ function renderPlaner(): string {
             <option value="kom">kom</option>
             <option value="kg">kg</option>
             <option value="g">g</option>
+            <option value="l">L</option>
+            <option value="ml">ml</option>
           </select>
           <input id="inp-plan-price" placeholder="Procjena (€)" style="width:110px;" />
           <button class="btn btn-primary" id="btn-add-planned">+ Dodaj</button>

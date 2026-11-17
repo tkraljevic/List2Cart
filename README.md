@@ -5,7 +5,7 @@
 ## Ključne značajke
 
 - **Skeniranje barkoda i fotografija proizvoda:** Skenirajte EAN-13 barkod kamerom ili ručno, uslikajte proizvod kako bi fotografija postala ikona artikla te dohvatite naziv i sliku online putem **Open Food Facts API-ja**.
-- **Kontrola računa u cent (`kom`, `kg`, `g`):** Unos količine u komadima, gramima ili kilogramima uz automatsku usporedbu zbroja košarice s iznosom na blagajni (`0,00 €` podudaranje ili izračun razlike).
+- **Kontrola računa u cent (`kom`, `kg`, `g`, `L`, `ml`):** Unos količine u komadima, gramima, kilogramima, litrama ili mililitrima uz automatsku usporedbu zbroja košarice s iznosom na blagajni (`0,00 €` podudaranje ili izračun razlike).
 - **Izvoz u Excel (`.xlsx`) i ispis:** Izvoz računa u formatiranu Excel tablicu (`rust_xlsxwriter`) i izravan ispis.
 - **Trgovine i Planer kupnje:** Upravljanje vlastitim trgovinama, praćenje povijesti cijena po dućanima (`★ NAJJEFTINIJE`) i kreiranje zajedničkih popisa za kupnju s prebacivanjem u košaricu.
 - **goCOP-stil sinkronizacija i automatsko čišćenje (`record_versions` + `VACUUM`):**

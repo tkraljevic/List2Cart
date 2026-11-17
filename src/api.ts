@@ -24,7 +24,7 @@ export function formatCents(cents: number): string {
 
 export function calcLineCents(qty: number, unit: Unit, priceCents: number): number {
   if (qty <= 0 || priceCents <= 0) return 0;
-  const eff = unit === "g" ? qty / 1000 : qty;
+  const eff = unit === "g" || unit === "ml" ? qty / 1000 : qty;
   return Math.round(eff * priceCents);
 }
 

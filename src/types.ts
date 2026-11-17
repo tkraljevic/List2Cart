@@ -1,4 +1,4 @@
-export type Unit = "kom" | "kg" | "g";
+export type Unit = "kom" | "kg" | "g" | "l" | "ml";
 
 export interface Store {
   id: number;

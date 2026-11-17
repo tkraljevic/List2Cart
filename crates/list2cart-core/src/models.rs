@@ -6,6 +6,8 @@ pub enum Unit {
     Kom,
     Kg,
     G,
+    L,
+    Ml,
 }
 
 impl Unit {
@@ -14,6 +16,8 @@ impl Unit {
             Self::Kom => "kom",
             Self::Kg => "kg",
             Self::G => "g",
+            Self::L => "l",
+            Self::Ml => "ml",
         }
     }
 
@@ -22,6 +26,8 @@ impl Unit {
             "kom" => Ok(Self::Kom),
             "kg" => Ok(Self::Kg),
             "g" => Ok(Self::G),
+            "l" => Ok(Self::L),
+            "ml" => Ok(Self::Ml),
             other => Err(format!("Nepoznata mjerna jedinica: {other}")),
         }
     }
