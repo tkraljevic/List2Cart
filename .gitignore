@@ -32,7 +32,8 @@ pairing-port
 *.list2cart
 *.list2cart.json
 
-# Sustav i razvojni alati
+# Sustav, skice dizajna i razvojni alati
+docs/design/
 .DS_Store
 Thumbs.db
 .quality/
