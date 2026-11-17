@@ -190,7 +190,7 @@ function renderSidebar(): string {
         <p>Uvijek točno u cent. Provjerite svaku stavku prije plaćanja na blagajni.</p>
         <div class="status-line">
           <span class="status-dot"></span>
-          <span>List2Cart 0.1 • Spreman</span>
+          <span>List2Cart 0.0.1-alfa • Spreman</span>
         </div>
       </div>
     </aside>

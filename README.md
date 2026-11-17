@@ -16,6 +16,12 @@
 - **Usporedba cijena i trgovine:** Pratite u kojoj je trgovini pojedini artikl najpovoljniji.
 - **Excel (`.xlsx`) i ispis:** Izvezite spremljeni račun u Excel tablicu ili ga ispišite.
 
+## Plan izdanja
+
+- **0.0.1 — Alfa** *(trenutno izdanje)*: Temeljna aplikacija, košarica, kontrola računa u cent (`kom`, `kg`, `g`, `L`, `ml`), skener, katalog, trgovine, planer i P2P knjiga verzija (`record_versions` + `VACUUM`).
+- **0.1.0 — Beta**: Prošireno testiranje u praksi i dodatna poboljšanja korisničkog iskustva na svim platformama.
+- **1.0.0 — Stabilno**: Potpuno stabilno izdanje za sve podržane platforme.
+
 ## Licenca
 
 Otvoreni kod pod **Europskom javnom licencom (EUPL-1.2)** — pogledajte [`LICENSE`](LICENSE) i [`LICENSE_hr.txt`](LICENSE_hr.txt).

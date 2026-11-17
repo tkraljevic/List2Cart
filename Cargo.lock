@@ -1884,7 +1884,7 @@ checksum = "4d9aae57673c1a235149777a74d152f3210ebd3e3b13346d2cdb6809e566bd3c"
 
 [[package]]
 name = "list2cart"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "list2cart-core",
  "serde",
@@ -1896,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "list2cart-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "chrono",
  "reqwest 0.12.28",
@@ -4945,7 +4945,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "yoke"
