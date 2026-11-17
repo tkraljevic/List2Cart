@@ -1,8 +1,42 @@
+# Rust / Tauri / Vite izgradnje i ovisnosti
 /target/
+/src-tauri/target/
+/src-tauri/gen/android/
+/src-tauri/gen/apple/
 /dist/
+/bin/
 /node_modules/
-.DS_Store
+
+# Lokalne SQLite baze podataka (nikad u repozitorij)
+data/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
-*.sqlite-journal
 *.sqlite-wal
 *.sqlite-shm
+*.sqlite-journal
+
+# Ključevi čvora i obiteljske mreže — identitet uređaja, nikad u repozitorij
+node-key
+**/node-key
+network-key
+**/network-key
+pairing-port
+.env
+.env.*
+
+# Korisnički izvozi (računi u Excelu i P2P sinkronizacijski paketi)
+*.xlsx
+*.list2cart
+*.list2cart.json
+
+# Sustav i razvojni alati
+.DS_Store
+Thumbs.db
+.quality/
+.claude/
+.vscode/
+.idea/
+*.log
