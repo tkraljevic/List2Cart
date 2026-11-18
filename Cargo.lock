@@ -2151,7 +2151,7 @@ checksum = "4d9aae57673c1a235149777a74d152f3210ebd3e3b13346d2cdb6809e566bd3c"
 
 [[package]]
 name = "list2cart"
-version = "0.0.1"
+version = "0.0.2-alpha"
 dependencies = [
  "list2cart-core",
  "serde",
@@ -2164,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "list2cart-core"
-version = "0.0.1"
+version = "0.0.2-alpha"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4003,7 +4003,7 @@ dependencies = [
 [[package]]
 name = "syncnet"
 version = "0.0.1"
-source = "git+https://github.com/tkraljevic/syncnet?rev=a2aaba1768e9f14c91cd2fc08b7e8d6a4b20526c#a2aaba1768e9f14c91cd2fc08b7e8d6a4b20526c"
+source = "git+https://github.com/tkraljevic/syncnet?rev=38459854f34848eecddfc8b74ee74acd579db352#38459854f34848eecddfc8b74ee74acd579db352"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -5514,7 +5514,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.1"
+version = "0.0.2-alpha"
 
 [[package]]
 name = "yasna"
