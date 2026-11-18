@@ -65,6 +65,8 @@ fn run_checks() -> Result<(), String> {
             "-p",
             "list2cart-core",
             "-p",
+            "list2cart-sync",
+            "-p",
             "xtask",
             "--all-targets",
             "--",
@@ -75,7 +77,15 @@ fn run_checks() -> Result<(), String> {
     run_step(
         &root,
         "testovi",
-        &["test", "-p", "list2cart-core", "-p", "xtask"],
+        &[
+            "test",
+            "-p",
+            "list2cart-core",
+            "-p",
+            "list2cart-sync",
+            "-p",
+            "xtask",
+        ],
     )?;
 
     if has_cargo_subcommand("deny") {

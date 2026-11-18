@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/list2cart-core", "src-tauri", "xtask"]
+members = ["crates/list2cart-core", "crates/list2cart-sync", "src-tauri", "xtask"]
 resolver = "3"
 
 [workspace.package]

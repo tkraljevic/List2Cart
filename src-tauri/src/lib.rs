@@ -16,7 +16,60 @@ use tauri::{Manager, State};
 
 pub struct AppState {
     pub db: Mutex<Database>,
+    pub retail: list2cart_core::retail::RetailSearch,
     pub export_dir: std::path::PathBuf,
+}
+
+#[tauri::command]
+fn inspect_price_csv(bytes: Vec<u8>) -> Result<list2cart_core::retail::CsvInspection, String> {
+    list2cart_core::retail::inspect_csv(&bytes)
+}
+#[tauri::command]
+fn read_price_csv(
+    bytes: Vec<u8>,
+    mapping: list2cart_core::retail::CsvMapping,
+) -> Result<Vec<list2cart_core::retail::RetailProduct>, String> {
+    list2cart_core::retail::parse_csv_mapped(&bytes, &mapping)
+}
+#[tauri::command]
+async fn retail_sources(
+    state: State<'_, AppState>,
+    chain: String,
+) -> Result<Vec<list2cart_core::retail::PriceSource>, String> {
+    state.retail.list_sources(&chain).await
+}
+#[tauri::command]
+async fn retail_search(
+    state: State<'_, AppState>,
+    source_url: String,
+    query: String,
+) -> Result<list2cart_core::retail::RetailResults, String> {
+    state.retail.search(&source_url, &query).await
+}
+
+#[tauri::command]
+fn identity_conflicts(
+    state: State<'_, AppState>,
+) -> Result<Vec<list2cart_core::db::IdentityConflict>, String> {
+    state
+        .db
+        .lock()
+        .map_err(|_| "Greska zakljucavanja baze")?
+        .identity_conflicts()
+}
+
+#[tauri::command]
+fn resolve_identity_conflict(
+    state: State<'_, AppState>,
+    entity: String,
+    keep_id: String,
+    expected_ids: Vec<String>,
+) -> Result<(), String> {
+    state
+        .db
+        .lock()
+        .map_err(|_| "Greska zakljucavanja baze")?
+        .resolve_identity_conflict(&entity, &keep_id, &expected_ids)
 }
 
 #[tauri::command]
@@ -52,6 +105,7 @@ fn get_product(state: State<'_, AppState>, barcode: String) -> Result<Option<Pro
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn upsert_product(
     state: State<'_, AppState>,
     barcode: String,
@@ -109,6 +163,15 @@ fn save_receipt(
 fn list_receipts(state: State<'_, AppState>) -> Result<Vec<ReceiptSummary>, String> {
     let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
     db.list_receipts()
+}
+
+#[tauri::command]
+fn incomplete_receipt_count(state: State<'_, AppState>) -> Result<usize, String> {
+    state
+        .db
+        .lock()
+        .map_err(|_| "Greska zakljucavanja baze")?
+        .incomplete_receipt_count()
 }
 
 #[tauri::command]
@@ -197,10 +260,41 @@ fn get_pocketbase_url(state: State<'_, AppState>) -> Result<Option<String>, Stri
 fn export_sync_bundle_json(
     state: State<'_, AppState>,
     role: Option<PeerRole>,
+    shared_lists: Option<String>,
 ) -> Result<String, String> {
     let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
-    let bundle = db.export_sync_bundle_for_role(role.unwrap_or(PeerRole::OwnDevice))?;
+    let bundle = db.export_sync_bundle_filtered(
+        role.unwrap_or(PeerRole::OwnDevice),
+        shared_lists.as_deref(),
+    )?;
     serde_json::to_string_pretty(&bundle).map_err(|e| format!("Greska serijalizacije: {e}"))
+}
+
+#[tauri::command]
+fn save_sync_bundle_file(
+    state: State<'_, AppState>,
+    json_str: String,
+    family_only: bool,
+) -> Result<String, String> {
+    use std::io::Write;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let prefix = if family_only { "OBITELJ" } else { "SVE" };
+    std::fs::create_dir_all(&state.export_dir).map_err(|e| e.to_string())?;
+    let path = state
+        .export_dir
+        .join(format!("List2Cart_{prefix}_{stamp}.list2cart.json"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    file.write_all(json_str.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("Paket nije potpuno spremljen: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -307,11 +401,39 @@ pub fn run() {
 
             app.manage(AppState {
                 db: Mutex::new(db),
+                retail: list2cart_core::retail::RetailSearch::default(),
                 export_dir,
+            });
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let worker = handle.clone();
+                    let result = tauri::async_runtime::spawn_blocking(move || {
+                        let state = worker.state::<AppState>();
+                        let db = state
+                            .db
+                            .lock()
+                            .map_err(|_| "Greska zakljucavanja baze".to_owned())?;
+                        db.run_scheduled_maintenance()
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => eprintln!("Odrzavanje baze nije uspjelo: {error}"),
+                        Err(error) => eprintln!("Radnik odrzavanja nije uspio: {error}"),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            retail_sources,
+            retail_search,
+            inspect_price_csv,
+            read_price_csv,
+            identity_conflicts,
+            resolve_identity_conflict,
             list_stores,
             add_store,
             list_products,
@@ -322,6 +444,7 @@ pub fn run() {
             verify_receipt,
             save_receipt,
             list_receipts,
+            incomplete_receipt_count,
             export_receipt_xlsx,
             list_shopping_lists,
             create_shopping_list,
@@ -332,6 +455,7 @@ pub fn run() {
             get_pocketbase_url,
             sync_pocketbase,
             export_sync_bundle_json,
+            save_sync_bundle_file,
             import_sync_bundle_json,
             get_ledger_stats,
             run_ledger_compact,

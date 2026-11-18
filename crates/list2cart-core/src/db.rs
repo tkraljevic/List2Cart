@@ -1,8 +1,11 @@
-use crate::calc::{calculate_cart_total_cents, calculate_line_total_cents};
+mod local;
+pub use local::{IdentityConflict, LocalEntity, SyncIdentity};
+
+use crate::calc::calculate_line_total_cents;
 use crate::ledger::{
     CompactionPolicy, LedgerStats, NetworkMember, PeerRole, add_network_member, auto_compact,
-    compute_delta, get_frontier, get_stats, ingest_remote_versions, init_ledger_schema,
-    list_network_members, record_version, remove_network_member, vacuum_db,
+    compute_delta, get_frontier, get_stats, init_ledger_schema, list_network_members,
+    remove_network_member, shared_lists_allows, vacuum_db, verify_peer_identity,
 };
 use crate::models::{
     CartItem, PlannedItem, Product, ReceiptSummary, ShoppingList, Store, StorePrice, SyncBundle,
@@ -10,7 +13,7 @@ use crate::models::{
 };
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -26,21 +29,66 @@ pub struct UpsertProductInput<'a> {
 
 pub struct Database {
     conn: Connection,
+    identity: local::LocalIdentity,
+}
+
+fn resolve_legacy_store(
+    conn: &Connection,
+    bundle: &SyncBundle,
+    source_id: Option<i64>,
+    name: Option<&str>,
+) -> Result<Option<i64>, String> {
+    if let Some(store) = source_id.and_then(|id| bundle.stores.iter().find(|s| s.id == id)) {
+        return conn
+            .query_row(
+                "SELECT id FROM stores WHERE sync_id=?1",
+                [&store.sync_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string());
+    }
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let mut stmt = conn
+        .prepare("SELECT id FROM stores WHERE LOWER(name)=LOWER(?1) ORDER BY sync_id")
+        .map_err(|e| e.to_string())?;
+    let ids = stmt
+        .query_map([name.trim()], |r| r.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    if ids.len() > 1 {
+        return Err("Legacy paket nema jednoznacnu referencu trgovine".into());
+    }
+    Ok(ids.first().copied())
 }
 
 impl Database {
+    #[cfg(test)]
+    pub(crate) fn test_connection(&self) -> &Connection {
+        &self.conn
+    }
+
     pub fn open(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("Greska baze podataka: {e}"))?;
-        let db = Self { conn };
+        let identity = local::LocalIdentity::load(&conn, path)?;
+        let db = Self { conn, identity };
         db.init_schema()?;
+        db.initialize_local_identity()?;
         Ok(db)
     }
 
     pub fn open_in_memory() -> Result<Self, String> {
         let conn =
             Connection::open_in_memory().map_err(|e| format!("Greska memorije baze: {e}"))?;
-        let db = Self { conn };
+        let db = Self {
+            conn,
+            identity: local::LocalIdentity::ephemeral(),
+        };
         db.init_schema()?;
+        db.initialize_local_identity()?;
         Ok(db)
     }
 
@@ -136,19 +184,12 @@ impl Database {
             .map_err(|e| format!("Greska inicijalizacije sheme: {e}"))?;
 
         init_ledger_schema(&self.conn)?;
-        let _ = self.node_id()?;
-        self.seed_default_stores()?;
-        let _ = auto_compact(&self.conn, CompactionPolicy::default());
+        crate::migrations::run_migrations(&self.conn)?;
         Ok(())
     }
 
     pub fn node_id(&self) -> Result<String, String> {
-        if let Some(id) = self.get_setting("node_id")? {
-            return Ok(id);
-        }
-        let id = format!("l2c-{}", &Uuid::new_v4().to_string()[..8]);
-        self.set_setting("node_id", &id)?;
-        Ok(id)
+        Ok(self.sync_identity().device_public_key)
     }
 
     pub fn ledger_stats(&self) -> Result<LedgerStats, String> {
@@ -197,56 +238,32 @@ impl Database {
 
     pub fn compact_ledger(&self) -> Result<usize, String> {
         let deleted = auto_compact(&self.conn, CompactionPolicy::default())?;
-        if deleted == 0 {
-            vacuum_db(&self.conn)?;
-        }
+        vacuum_db(&self.conn)?;
+        self.set_setting(
+            "maintenance_last_success",
+            &Utc::now().timestamp().to_string(),
+        )?;
         Ok(deleted)
     }
 
-    fn seed_default_stores(&self) -> Result<(), String> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM stores", [], |r| r.get(0))
-            .map_err(|e| format!("Greska brojanja trgovina: {e}"))?;
-
-        if count == 0 {
-            let defaults = [
-                ("Super Konzum", "Zagreb", "#DC2626"),
-                ("Kaufland", "Zagreb", "#1768D1"),
-                ("Lidl", "Zagreb", "#D97706"),
-                ("Spar", "Zagreb", "#16A34A"),
-                ("DM Drogerie Markt", "Centar", "#0284C7"),
-            ];
-            for (name, location, color) in defaults {
-                self.add_store(name, location, color)?;
-            }
+    /// At most once per day; a failed run remains due and can be retried.
+    pub fn run_scheduled_maintenance(&self) -> Result<Option<usize>, String> {
+        let now = Utc::now().timestamp();
+        let last = self
+            .get_setting("maintenance_last_success")?
+            .and_then(|value| value.parse::<i64>().ok());
+        if last.is_some_and(|last| now >= last && now - last < 86400) {
+            return Ok(None);
         }
-        Ok(())
+        self.compact_ledger().map(Some)
+    }
+
+    fn seed_default_stores(&self) -> Result<(), String> {
+        self.local_seed_stores()
     }
 
     pub fn add_store(&self, name: &str, location: &str, color: &str) -> Result<Store, String> {
-        let sync_id = Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
-        self.conn
-            .execute(
-                "INSERT INTO stores (sync_id, name, location, color, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![sync_id, name.trim(), location.trim(), color.trim(), now],
-            )
-            .map_err(|e| format!("Greska dodavanja trgovine: {e}"))?;
-        let id = self.conn.last_insert_rowid();
-        let store = Store {
-            id,
-            sync_id: sync_id.clone(),
-            name: name.trim().to_owned(),
-            location: location.trim().to_owned(),
-            color: color.trim().to_owned(),
-            item_count: 0,
-            updated_at: now,
-        };
-        if let (Ok(node), Ok(payload)) = (self.node_id(), serde_json::to_string(&store)) {
-            let _ = record_version(&self.conn, &node, "stores", &sync_id, false, &payload, "");
-        }
-        Ok(store)
+        self.local_add_store(name, location, color)
     }
 
     pub fn list_stores(&self) -> Result<Vec<Store>, String> {
@@ -257,6 +274,7 @@ impl Database {
                 SELECT s.id, s.sync_id, s.name, s.location, s.color, s.updated_at,
                        (SELECT COUNT(DISTINCT ph.barcode) FROM price_history ph WHERE ph.store_name = s.name) as item_count
                 FROM stores s
+                  WHERE s.archived = 0
                 ORDER BY s.id ASC
                 ",
             )
@@ -284,79 +302,26 @@ impl Database {
     }
 
     pub fn upsert_product(&self, input: &UpsertProductInput<'_>) -> Result<Product, String> {
-        let now = Utc::now().to_rfc3339();
-        let existing_sync_id: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT sync_id FROM products WHERE barcode = ?1",
-                params![input.barcode],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("Greska provjere artikla: {e}"))?;
-
-        let sync_id = existing_sync_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-
-        self.conn
-            .execute(
-                "
-                INSERT INTO products (barcode, sync_id, name, category, default_unit, last_price_cents, last_store_name, image_data_url, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                ON CONFLICT(barcode) DO UPDATE SET
-                    name = excluded.name,
-                    category = excluded.category,
-                    default_unit = excluded.default_unit,
-                    last_price_cents = excluded.last_price_cents,
-                    last_store_name = excluded.last_store_name,
-                    image_data_url = COALESCE(excluded.image_data_url, products.image_data_url),
-                    updated_at = excluded.updated_at
-                ",
-                params![
-                    input.barcode.trim(),
-                    sync_id,
-                    input.name.trim(),
-                    input.category.trim(),
-                    input.default_unit.as_str(),
-                    input.price_cents,
-                    input.store_name.trim(),
-                    input.image_data_url,
-                    now
-                ],
-            )
-            .map_err(|e| format!("Greska spremanja artikla: {e}"))?;
-
-        if input.price_cents > 0 && !input.store_name.trim().is_empty() {
-            self.conn
-                .execute(
-                    "INSERT INTO price_history (barcode, store_name, price_cents, recorded_at) VALUES (?1, ?2, ?3, ?4)",
-                    params![input.barcode.trim(), input.store_name.trim(), input.price_cents, now],
-                )
-                .map_err(|e| format!("Greska spremanja povijesti cijena: {e}"))?;
-        }
-
-        let prod = self
-            .get_product(input.barcode)?
-            .ok_or_else(|| "Artikl nije pronadjen nakon spremanja".to_owned())?;
-        if let (Ok(node), Ok(payload)) = (self.node_id(), serde_json::to_string(&prod)) {
-            let _ = record_version(
-                &self.conn,
-                &node,
-                "products",
-                &prod.barcode,
-                false,
-                &payload,
-                "",
-            );
-        }
-        Ok(prod)
+        self.local_upsert_product(input)
     }
 
     pub fn get_product(&self, barcode: &str) -> Result<Option<Product>, String> {
+        let matches: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM products WHERE barcode=?1 AND archived=0",
+                [barcode.trim()],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if matches > 1 {
+            return Err("Vise artikala ima isti barkod; odaberite stabilni identitet".into());
+        }
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT barcode, sync_id, name, category, default_unit, last_price_cents, last_store_name, image_data_url, updated_at
-                 FROM products WHERE barcode = ?1",
+                 FROM products WHERE barcode = ?1 AND archived = 0",
             )
             .map_err(|e| format!("Greska upita artikla: {e}"))?;
 
@@ -388,7 +353,7 @@ impl Database {
             .prepare(
                 "SELECT barcode, sync_id, name, category, default_unit, last_price_cents, last_store_name, image_data_url, updated_at
                  FROM products
-                 WHERE LOWER(name) LIKE ?1 OR LOWER(barcode) LIKE ?1 OR LOWER(category) LIKE ?1
+                   WHERE archived = 0 AND (LOWER(name) LIKE ?1 OR LOWER(barcode) LIKE ?1 OR LOWER(category) LIKE ?1)
                  ORDER BY updated_at DESC",
             )
             .map_err(|e| format!("Greska listanja artikala: {e}"))?;
@@ -418,6 +383,17 @@ impl Database {
     }
 
     pub fn get_product_store_prices(&self, barcode: &str) -> Result<Vec<StorePrice>, String> {
+        let matches: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM products WHERE barcode=?1 AND archived=0",
+                [barcode.trim()],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if matches > 1 {
+            return Err("Povijest cijena zahtijeva jednoznacan identitet artikla".into());
+        }
         let mut stmt = self
             .conn
             .prepare(
@@ -427,7 +403,8 @@ impl Database {
                 INNER JOIN (
                     SELECT store_name, MAX(id) AS max_id
                     FROM price_history
-                    WHERE barcode = ?1
+                      WHERE barcode = ?1 AND archived = 0
+                        AND product_sync_id IN (SELECT sync_id FROM products WHERE barcode=?1 AND archived=0)
                     GROUP BY store_name
                 ) latest ON ph.id = latest.max_id
                 ORDER BY ph.price_cents ASC
@@ -464,72 +441,7 @@ impl Database {
         items: &[CartItem],
         receipt_total_cents: i64,
     ) -> Result<ReceiptSummary, String> {
-        let sync_id = Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
-        let cart_total_cents = calculate_cart_total_cents(items);
-        let difference_cents = cart_total_cents - receipt_total_cents;
-
-        self.conn
-            .execute(
-                "INSERT INTO receipts (sync_id, store_id, store_name, created_at, cart_total_cents, receipt_total_cents, difference_cents)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    sync_id,
-                    store_id,
-                    store_name,
-                    now,
-                    cart_total_cents,
-                    receipt_total_cents,
-                    difference_cents
-                ],
-            )
-            .map_err(|e| format!("Greska spremanja racuna: {e}"))?;
-
-        let receipt_id = self.conn.last_insert_rowid();
-
-        for item in items {
-            let line_total =
-                calculate_line_total_cents(item.quantity, item.unit, item.unit_price_cents);
-            self.conn
-                .execute(
-                    "INSERT INTO receipt_items (receipt_id, barcode, name, quantity, unit, unit_price_cents, total_cents)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        receipt_id,
-                        item.barcode,
-                        item.name,
-                        item.quantity,
-                        item.unit.as_str(),
-                        item.unit_price_cents,
-                        line_total
-                    ],
-                )
-                .map_err(|e| format!("Greska spremanja stavke racuna: {e}"))?;
-
-            if !item.barcode.trim().is_empty() {
-                let _ = self.upsert_product(&UpsertProductInput {
-                    barcode: &item.barcode,
-                    name: &item.name,
-                    category: "Opce",
-                    default_unit: item.unit,
-                    price_cents: item.unit_price_cents,
-                    store_name,
-                    image_data_url: item.image_data_url.as_deref(),
-                });
-            }
-        }
-
-        Ok(ReceiptSummary {
-            id: receipt_id,
-            sync_id,
-            store_id,
-            store_name: store_name.to_owned(),
-            created_at: now,
-            items: items.to_vec(),
-            cart_total_cents,
-            receipt_total_cents,
-            difference_cents,
-        })
+        self.local_save_receipt(store_id, store_name, items, receipt_total_cents)
     }
 
     pub fn list_receipts(&self) -> Result<Vec<ReceiptSummary>, String> {
@@ -537,7 +449,7 @@ impl Database {
             .conn
             .prepare(
                 "SELECT id, sync_id, store_id, store_name, created_at, cart_total_cents, receipt_total_cents, difference_cents
-                 FROM receipts ORDER BY id DESC",
+                 FROM receipts WHERE archived = 0 ORDER BY id DESC",
             )
             .map_err(|e| format!("Greska listanja racuna: {e}"))?;
 
@@ -560,10 +472,30 @@ impl Database {
         let mut receipts = Vec::new();
         for row in rows {
             let mut r = row.map_err(|e| format!("Greska retka racuna: {e}"))?;
+            if !crate::apply::receipt_is_complete(&self.conn, &r.sync_id)? {
+                continue;
+            }
             r.items = self.get_receipt_items(r.id)?;
             receipts.push(r);
         }
         Ok(receipts)
+    }
+
+    pub fn incomplete_receipt_count(&self) -> Result<usize, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT sync_id FROM receipts WHERE archived=0")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut count = 0;
+        for row in rows {
+            if !crate::apply::receipt_is_complete(&self.conn, &row.map_err(|e| e.to_string())?)? {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     fn get_receipt_items(&self, receipt_id: i64) -> Result<Vec<CartItem>, String> {
@@ -571,7 +503,7 @@ impl Database {
             .conn
             .prepare(
                 "SELECT id, barcode, name, quantity, unit, unit_price_cents, total_cents
-                 FROM receipt_items WHERE receipt_id = ?1 ORDER BY id ASC",
+                 FROM receipt_items WHERE receipt_id = ?1 AND archived = 0 ORDER BY id ASC",
             )
             .map_err(|e| format!("Greska upita stavki racuna: {e}"))?;
 
@@ -604,25 +536,7 @@ impl Database {
         name: &str,
         store_id: Option<i64>,
     ) -> Result<ShoppingList, String> {
-        let sync_id = Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
-        self.conn
-            .execute(
-                "INSERT INTO shopping_lists (sync_id, name, store_id, updated_at) VALUES (?1, ?2, ?3, ?4)",
-                params![sync_id, name.trim(), store_id, now],
-            )
-            .map_err(|e| format!("Greska kreiranja popisa: {e}"))?;
-        let id = self.conn.last_insert_rowid();
-        Ok(ShoppingList {
-            id,
-            sync_id,
-            name: name.trim().to_owned(),
-            store_id,
-            store_name: None,
-            items: Vec::new(),
-            total_estimated_cents: 0,
-            updated_at: now,
-        })
+        self.local_create_list(name, store_id)
     }
 
     pub fn add_planned_item(
@@ -634,48 +548,18 @@ impl Database {
         unit: Unit,
         estimated_price_cents: i64,
     ) -> Result<PlannedItem, String> {
-        let sync_id = Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
-        self.conn
-            .execute(
-                "INSERT INTO planned_items (sync_id, list_id, barcode, name, quantity, unit, estimated_price_cents, checked, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
-                params![
-                    sync_id,
-                    list_id,
-                    barcode,
-                    name.trim(),
-                    quantity,
-                    unit.as_str(),
-                    estimated_price_cents,
-                    now
-                ],
-            )
-            .map_err(|e| format!("Greska dodavanja na popis: {e}"))?;
-        let id = self.conn.last_insert_rowid();
-        Ok(PlannedItem {
-            id,
-            sync_id,
+        self.local_add_item(
             list_id,
-            barcode: barcode.map(ToOwned::to_owned),
-            name: name.trim().to_owned(),
+            barcode,
+            name,
             quantity,
             unit,
             estimated_price_cents,
-            checked: false,
-            updated_at: now,
-        })
+        )
     }
 
     pub fn toggle_planned_item(&self, item_id: i64, checked: bool) -> Result<(), String> {
-        let now = Utc::now().to_rfc3339();
-        self.conn
-            .execute(
-                "UPDATE planned_items SET checked = ?1, updated_at = ?2 WHERE id = ?3",
-                params![i32::from(checked), now, item_id],
-            )
-            .map_err(|e| format!("Greska azuriranja stavke popisa: {e}"))?;
-        Ok(())
+        self.local_toggle_item(item_id, checked)
     }
 
     pub fn list_shopping_lists(&self) -> Result<Vec<ShoppingList>, String> {
@@ -685,6 +569,7 @@ impl Database {
                 "SELECT sl.id, sl.sync_id, sl.name, sl.store_id, s.name, sl.updated_at
                  FROM shopping_lists sl
                  LEFT JOIN stores s ON sl.store_id = s.id
+                  WHERE sl.archived = 0
                  ORDER BY sl.id DESC",
             )
             .map_err(|e| format!("Greska listanja popisa: {e}"))?;
@@ -708,11 +593,7 @@ impl Database {
         for row in rows {
             let mut list = row.map_err(|e| format!("Greska retka popisa: {e}"))?;
             list.items = self.get_planned_items(list.id)?;
-            list.total_estimated_cents = list
-                .items
-                .iter()
-                .map(|i| calculate_line_total_cents(i.quantity, i.unit, i.estimated_price_cents))
-                .sum();
+            list.total_estimated_cents = Self::checked_list_total(&self.conn, list.id)?;
             lists.push(list);
         }
         Ok(lists)
@@ -723,7 +604,7 @@ impl Database {
             .conn
             .prepare(
                 "SELECT id, sync_id, list_id, barcode, name, quantity, unit, estimated_price_cents, checked, updated_at
-                 FROM planned_items WHERE list_id = ?1 ORDER BY checked ASC, id ASC",
+                 FROM planned_items WHERE list_id = ?1 AND archived = 0 ORDER BY checked ASC, id ASC",
             )
             .map_err(|e| format!("Greska upita stavki popisa: {e}"))?;
 
@@ -780,33 +661,143 @@ impl Database {
     }
 
     pub fn export_sync_bundle_for_role(&self, role: PeerRole) -> Result<SyncBundle, String> {
+        self.export_sync_bundle_filtered(role, None)
+    }
+
+    pub fn export_sync_bundle_filtered(
+        &self,
+        role: PeerRole,
+        shared_lists_override: Option<&str>,
+    ) -> Result<SyncBundle, String> {
+        let source_node_id = self.node_id()?;
+        let network_name = self.network_name()?;
         let frontier = get_frontier(&self.conn)?;
         let all_versions = compute_delta(&self.conn, &BTreeMap::new(), 5000)?;
         let lists = self.list_shopping_lists()?;
+        let members = self.list_members()?;
 
         match role {
-            PeerRole::OwnDevice => Ok(SyncBundle {
-                version: 1,
-                exported_at: Utc::now().to_rfc3339(),
-                stores: self.list_stores()?,
-                products: self.list_products(None)?,
-                lists,
-                frontier,
-                versions: all_versions,
-            }),
-            PeerRole::FamilyMember => {
-                // Članovima obitelji šaljemo SAMO liste za kupnju i artikle/trgovine koji se nalaze na tim listama
-                let versions = all_versions
-                    .into_iter()
-                    .filter(|v| v.channel == "obitelj" || v.entity == "shopping_lists")
-                    .collect();
+            PeerRole::OwnDevice => {
+                let own_sas = members
+                    .iter()
+                    .find(|m| m.role == PeerRole::OwnDevice)
+                    .map(|m| m.sas_code.clone());
                 Ok(SyncBundle {
                     version: 1,
                     exported_at: Utc::now().to_rfc3339(),
+                    source_node_id,
+                    network_name,
+                    role: Some(PeerRole::OwnDevice),
+                    sas_code: own_sas,
+                    shared_lists: Some("*".to_owned()),
                     stores: self.list_stores()?,
-                    products: Vec::new(),
+                    products: self.list_products(None)?,
+                    receipts: self.list_receipts()?,
                     lists,
                     frontier,
+                    versions: all_versions,
+                })
+            }
+            PeerRole::FamilyMember => {
+                let family_members: Vec<&NetworkMember> = members
+                    .iter()
+                    .filter(|m| m.role == PeerRole::FamilyMember)
+                    .collect();
+
+                let effective_filter = match shared_lists_override
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(explicit) => explicit.to_owned(),
+                    None if !family_members.is_empty() => {
+                        let any_wildcard = family_members
+                            .iter()
+                            .any(|m| shared_lists_allows(&m.shared_lists, "__any__", "__any__"));
+                        if any_wildcard {
+                            "*".to_owned()
+                        } else {
+                            family_members
+                                .iter()
+                                .map(|m| m.shared_lists.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    }
+                    None => "*".to_owned(),
+                };
+
+                let family_sas = family_members.first().map(|m| m.sas_code.clone());
+
+                let filtered_lists: Vec<ShoppingList> = lists
+                    .into_iter()
+                    .filter(|l| shared_lists_allows(&effective_filter, &l.name, &l.sync_id))
+                    .collect();
+
+                let allowed_list_sync_ids: HashSet<String> =
+                    filtered_lists.iter().map(|l| l.sync_id.clone()).collect();
+                let allowed_item_sync_ids: HashSet<String> = filtered_lists
+                    .iter()
+                    .flat_map(|l| l.items.iter().map(|i| i.sync_id.clone()))
+                    .collect();
+                let referenced_store_ids: HashSet<i64> =
+                    filtered_lists.iter().filter_map(|l| l.store_id).collect();
+                let referenced_store_names: HashSet<String> = filtered_lists
+                    .iter()
+                    .filter_map(|l| l.store_name.as_ref().map(|n| n.to_lowercase()))
+                    .collect();
+                let referenced_barcodes: HashSet<String> = filtered_lists
+                    .iter()
+                    .flat_map(|l| {
+                        l.items
+                            .iter()
+                            .filter_map(|i| i.barcode.as_ref().map(|b| b.trim().to_owned()))
+                    })
+                    .filter(|b| !b.is_empty())
+                    .collect();
+
+                let stores: Vec<Store> = self
+                    .list_stores()?
+                    .into_iter()
+                    .filter(|s| {
+                        referenced_store_ids.contains(&s.id)
+                            || referenced_store_names.contains(&s.name.to_lowercase())
+                    })
+                    .collect();
+
+                let products: Vec<Product> = self
+                    .list_products(None)?
+                    .into_iter()
+                    .filter(|p| referenced_barcodes.contains(p.barcode.trim()))
+                    .collect();
+
+                let versions = all_versions
+                    .into_iter()
+                    .filter(|v| {
+                        (v.entity == "shopping_lists"
+                            && allowed_list_sync_ids.contains(&v.entity_id))
+                            || (v.entity == "planned_items"
+                                && allowed_item_sync_ids.contains(&v.entity_id))
+                    })
+                    .collect();
+
+                let family_frontier = frontier
+                    .into_iter()
+                    .filter(|(k, _)| k.ends_with("|obitelj"))
+                    .collect();
+
+                Ok(SyncBundle {
+                    version: 1,
+                    exported_at: Utc::now().to_rfc3339(),
+                    source_node_id,
+                    network_name,
+                    role: Some(PeerRole::FamilyMember),
+                    sas_code: family_sas,
+                    shared_lists: Some(effective_filter),
+                    stores,
+                    products,
+                    receipts: Vec::new(),
+                    lists: filtered_lists,
+                    frontier: family_frontier,
                     versions,
                 })
             }
@@ -814,84 +805,410 @@ impl Database {
     }
 
     pub fn import_sync_bundle(&self, bundle: &SyncBundle) -> Result<(usize, usize, usize), String> {
-        if !bundle.versions.is_empty() {
-            let _ = ingest_remote_versions(&self.conn, &bundle.versions);
+        if bundle.version != 1 {
+            return Err("Nepodrzana inacica legacy paketa".into());
         }
+        let local_node_id = self.node_id()?;
+        let (effective_role, member_shared_lists) = verify_peer_identity(
+            &self.conn,
+            &local_node_id,
+            &bundle.source_node_id,
+            bundle.sas_code.as_deref(),
+            bundle.role,
+        )?;
+
+        let effective_list_filter = member_shared_lists
+            .as_deref()
+            .or(bundle.shared_lists.as_deref())
+            .unwrap_or("*");
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Greska pokretanja transakcije uvoza: {e}"))?;
+
+        // This is an explicit legacy snapshot import, never authenticated peer
+        // admission. Ignore supplied version/author/role proofs entirely.
+        // Changed snapshots are recorded as new local changes before commit.
 
         let mut added_stores = 0usize;
         for store in &bundle.stores {
-            let exists: bool = self
-                .conn
+            let existing: Option<(i64, String)> = tx
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM stores WHERE sync_id = ?1 OR name = ?2)",
-                    params![store.sync_id, store.name],
-                    |r| r.get(0),
+                    "SELECT id, updated_at FROM stores WHERE sync_id = ?1",
+                    params![store.sync_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
+                .optional()
                 .map_err(|e| format!("Greska provjere trgovine: {e}"))?;
-            if !exists
-                && self
-                    .add_store(&store.name, &store.location, &store.color)
-                    .is_ok()
-            {
-                added_stores += 1;
+
+            let store_updated = if store.updated_at.trim().is_empty() {
+                Utc::now().to_rfc3339()
+            } else {
+                store.updated_at.clone()
+            };
+
+            match existing {
+                None => {
+                    let sync_id = if store.sync_id.trim().is_empty() {
+                        Uuid::new_v4().to_string()
+                    } else {
+                        store.sync_id.trim().to_owned()
+                    };
+                    tx.execute(
+                        "INSERT INTO stores (sync_id, name, location, color, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            sync_id,
+                            store.name.trim(),
+                            store.location.trim(),
+                            store.color.trim(),
+                            store_updated
+                        ],
+                    )
+                    .map_err(|e| format!("Greska uvoza trgovine: {e}"))?;
+                    added_stores += 1;
+                }
+                Some((id, local_updated))
+                    if !store.updated_at.is_empty() && store.updated_at > local_updated =>
+                {
+                    tx.execute(
+                        "UPDATE stores SET location = ?1, color = ?2, updated_at = ?3 WHERE id = ?4",
+                        params![store.location.trim(), store.color.trim(), store.updated_at, id],
+                    )
+                    .map_err(|e| format!("Greska azuriranja trgovine: {e}"))?;
+                    added_stores += 1;
+                }
+                _ => {}
             }
         }
 
         let mut merged_products = 0usize;
         for prod in &bundle.products {
-            let local = self.get_product(&prod.barcode)?;
-            let should_apply = match local {
+            let local_updated: Option<String> = tx
+                .query_row(
+                    "SELECT updated_at FROM products WHERE sync_id = ?1",
+                    params![prod.sync_id.trim()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("Greska provjere artikla pri uvozu: {e}"))?;
+
+            let should_apply = match local_updated {
                 None => true,
-                Some(ref existing) => prod.updated_at > existing.updated_at,
+                Some(ref existing_ts) => prod.updated_at > *existing_ts,
             };
+
             if should_apply {
-                self.upsert_product(&UpsertProductInput {
-                    barcode: &prod.barcode,
-                    name: &prod.name,
-                    category: &prod.category,
-                    default_unit: prod.default_unit,
-                    price_cents: prod.last_price_cents,
-                    store_name: &prod.last_store_name,
-                    image_data_url: prod.image_data_url.as_deref(),
-                })?;
+                let sync_id = if prod.sync_id.trim().is_empty() {
+                    Uuid::new_v4().to_string()
+                } else {
+                    prod.sync_id.trim().to_owned()
+                };
+                let updated_at = if prod.updated_at.trim().is_empty() {
+                    Utc::now().to_rfc3339()
+                } else {
+                    prod.updated_at.clone()
+                };
+                tx.execute(
+                    "
+                    INSERT INTO products (barcode, sync_id, name, category, default_unit, last_price_cents, last_store_name, image_data_url, updated_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                      ON CONFLICT(sync_id) DO UPDATE SET
+                        name = excluded.name,
+                        category = excluded.category,
+                        default_unit = excluded.default_unit,
+                        last_price_cents = excluded.last_price_cents,
+                        last_store_name = excluded.last_store_name,
+                        image_data_url = COALESCE(excluded.image_data_url, products.image_data_url),
+                        updated_at = excluded.updated_at
+                    ",
+                    params![
+                        prod.barcode.trim(),
+                        sync_id,
+                        prod.name.trim(),
+                        prod.category.trim(),
+                        prod.default_unit.as_str(),
+                        prod.last_price_cents,
+                        prod.last_store_name.trim(),
+                        prod.image_data_url,
+                        updated_at
+                    ],
+                )
+                .map_err(|e| format!("Greska uvoza artikla: {e}"))?;
+
+                if prod.last_price_cents > 0 && !prod.last_store_name.trim().is_empty() {
+                    tx.execute(
+                        "INSERT INTO price_history (barcode, store_name, price_cents, recorded_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            prod.barcode.trim(),
+                            prod.last_store_name.trim(),
+                            prod.last_price_cents,
+                            updated_at
+                        ],
+                    )
+                    .map_err(|e| format!("Greska uvoza povijesti cijene: {e}"))?;
+                }
                 merged_products += 1;
+            }
+        }
+
+        if effective_role == PeerRole::OwnDevice {
+            for receipt in &bundle.receipts {
+                let exists: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM receipts WHERE sync_id = ?1)",
+                        params![receipt.sync_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| format!("Greska provjere racuna pri uvozu: {e}"))?;
+                if exists {
+                    continue;
+                }
+
+                let resolved_store_id = resolve_legacy_store(
+                    &tx,
+                    bundle,
+                    Some(receipt.store_id),
+                    Some(&receipt.store_name),
+                )?
+                .ok_or("Nedostaje trgovina legacy racuna")?;
+
+                let normalized_items: Vec<CartItem> = receipt
+                    .items
+                    .iter()
+                    .map(|item| {
+                        let line_total = calculate_line_total_cents(
+                            item.quantity,
+                            item.unit,
+                            item.unit_price_cents,
+                        );
+                        CartItem {
+                            id: item.id.clone(),
+                            barcode: item.barcode.trim().to_owned(),
+                            name: item.name.trim().to_owned(),
+                            quantity: item.quantity,
+                            unit: item.unit,
+                            unit_price_cents: item.unit_price_cents,
+                            total_cents: line_total,
+                            image_data_url: item.image_data_url.clone(),
+                        }
+                    })
+                    .collect();
+
+                if receipt.receipt_total_cents < 0 {
+                    return Err("Iznos uvezenog racuna je negativan".into());
+                }
+                let cart_total_cents = normalized_items.iter().try_fold(0i64, |total, item| {
+                    let line = crate::calc::checked_line_total_cents(
+                        item.quantity,
+                        item.unit,
+                        item.unit_price_cents,
+                    )?;
+                    total
+                        .checked_add(line)
+                        .ok_or_else(|| "Zbroj uvezenog racuna prelazi raspon".to_owned())
+                })?;
+                let difference_cents = cart_total_cents - receipt.receipt_total_cents;
+
+                tx.execute(
+                    "INSERT INTO receipts (sync_id, store_id, store_name, created_at, cart_total_cents, receipt_total_cents, difference_cents)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        receipt.sync_id,
+                        resolved_store_id,
+                        receipt.store_name.trim(),
+                        receipt.created_at,
+                        cart_total_cents,
+                        receipt.receipt_total_cents,
+                        difference_cents
+                    ],
+                )
+                .map_err(|e| format!("Greska uvoza racuna: {e}"))?;
+
+                let receipt_id = tx.last_insert_rowid();
+                for item in &normalized_items {
+                    tx.execute(
+                        "INSERT INTO receipt_items (receipt_id, barcode, name, quantity, unit, unit_price_cents, total_cents)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            receipt_id,
+                            item.barcode,
+                            item.name,
+                            item.quantity,
+                            item.unit.as_str(),
+                            item.unit_price_cents,
+                            item.total_cents
+                        ],
+                    )
+                    .map_err(|e| format!("Greska uvoza stavke racuna: {e}"))?;
+                }
             }
         }
 
         let mut added_lists = 0usize;
         for list in &bundle.lists {
-            let exists: bool = self
-                .conn
+            if effective_role == PeerRole::FamilyMember
+                && !shared_lists_allows(effective_list_filter, &list.name, &list.sync_id)
+            {
+                continue;
+            }
+
+            let resolved_store_id =
+                resolve_legacy_store(&tx, bundle, list.store_id, list.store_name.as_deref())?;
+
+            let existing_list: Option<(i64, String, Option<i64>, String)> = tx
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM shopping_lists WHERE sync_id = ?1)",
+                    "SELECT id, name, store_id, updated_at FROM shopping_lists WHERE sync_id = ?1",
                     params![list.sync_id],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
+                .optional()
                 .map_err(|e| format!("Greska provjere popisa: {e}"))?;
-            if !exists {
-                let now = Utc::now().to_rfc3339();
-                self.conn
-                    .execute(
-                        "INSERT INTO shopping_lists (sync_id, name, store_id, updated_at) VALUES (?1, ?2, NULL, ?3)",
-                        params![list.sync_id, list.name, now],
+
+            let list_updated = if list.updated_at.trim().is_empty() {
+                Utc::now().to_rfc3339()
+            } else {
+                list.updated_at.clone()
+            };
+
+            match existing_list {
+                None => {
+                    tx.execute(
+                        "INSERT INTO shopping_lists (sync_id, name, store_id, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![list.sync_id, list.name.trim(), resolved_store_id, list_updated],
                     )
                     .map_err(|e| format!("Greska uvoza popisa: {e}"))?;
-                let list_id = self.conn.last_insert_rowid();
-                for item in &list.items {
-                    let _ = self.add_planned_item(
-                        list_id,
-                        item.barcode.as_deref(),
-                        &item.name,
-                        item.quantity,
-                        item.unit,
-                        item.estimated_price_cents,
-                    );
+                    let list_id = tx.last_insert_rowid();
+                    for item in &list.items {
+                        let item_sync_id = if item.sync_id.trim().is_empty() {
+                            Uuid::new_v4().to_string()
+                        } else {
+                            item.sync_id.trim().to_owned()
+                        };
+                        let item_updated = if item.updated_at.trim().is_empty() {
+                            list_updated.clone()
+                        } else {
+                            item.updated_at.clone()
+                        };
+                        tx.execute(
+                            "INSERT INTO planned_items (sync_id, list_id, barcode, name, quantity, unit, estimated_price_cents, checked, updated_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                            params![
+                                item_sync_id,
+                                list_id,
+                                item.barcode.as_deref(),
+                                item.name.trim(),
+                                item.quantity,
+                                item.unit.as_str(),
+                                item.estimated_price_cents,
+                                i32::from(item.checked),
+                                item_updated
+                            ],
+                        )
+                        .map_err(|e| format!("Greska uvoza stavke popisa: {e}"))?;
+                    }
+                    added_lists += 1;
                 }
-                added_lists += 1;
+                Some((list_id, local_name, local_store_id, local_updated_at)) => {
+                    let mut list_changed = false;
+                    if list_updated > local_updated_at
+                        && (list.name.trim() != local_name || resolved_store_id != local_store_id)
+                    {
+                        tx.execute(
+                            "UPDATE shopping_lists SET name = ?1, store_id = COALESCE(?2, store_id), updated_at = ?3 WHERE id = ?4",
+                            params![list.name.trim(), resolved_store_id, list_updated, list_id],
+                        )
+                        .map_err(|e| format!("Greska azuriranja popisa: {e}"))?;
+                        list_changed = true;
+                    }
+
+                    for item in &list.items {
+                        let existing_item: Option<(i64, String)> = tx
+                            .query_row(
+                                "SELECT id, updated_at FROM planned_items WHERE sync_id = ?1",
+                                params![item.sync_id],
+                                |r| Ok((r.get(0)?, r.get(1)?)),
+                            )
+                            .optional()
+                            .map_err(|e| format!("Greska provjere stavke popisa: {e}"))?;
+
+                        let item_updated = if item.updated_at.trim().is_empty() {
+                            list_updated.clone()
+                        } else {
+                            item.updated_at.clone()
+                        };
+
+                        match existing_item {
+                            None => {
+                                let item_sync_id = if item.sync_id.trim().is_empty() {
+                                    Uuid::new_v4().to_string()
+                                } else {
+                                    item.sync_id.trim().to_owned()
+                                };
+                                tx.execute(
+                                    "INSERT INTO planned_items (sync_id, list_id, barcode, name, quantity, unit, estimated_price_cents, checked, updated_at)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                    params![
+                                        item_sync_id,
+                                        list_id,
+                                        item.barcode.as_deref(),
+                                        item.name.trim(),
+                                        item.quantity,
+                                        item.unit.as_str(),
+                                        item.estimated_price_cents,
+                                        i32::from(item.checked),
+                                        item_updated
+                                    ],
+                                )
+                                .map_err(|e| format!("Greska dodavanja nove stavke u postojeci popis: {e}"))?;
+                                list_changed = true;
+                            }
+                            Some((local_item_id, local_item_updated))
+                                if item_updated > local_item_updated =>
+                            {
+                                tx.execute(
+                                    "UPDATE planned_items
+                                     SET barcode = ?1, name = ?2, quantity = ?3, unit = ?4, estimated_price_cents = ?5, checked = ?6, updated_at = ?7
+                                     WHERE id = ?8",
+                                    params![
+                                        item.barcode.as_deref(),
+                                        item.name.trim(),
+                                        item.quantity,
+                                        item.unit.as_str(),
+                                        item.estimated_price_cents,
+                                        i32::from(item.checked),
+                                        item_updated,
+                                        local_item_id
+                                    ],
+                                )
+                                .map_err(|e| format!("Greska azuriranja stavke popisa pri uvozu: {e}"))?;
+                                list_changed = true;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if list_changed {
+                        let newest_ts = if list_updated > local_updated_at {
+                            list_updated
+                        } else {
+                            Utc::now().to_rfc3339()
+                        };
+                        tx.execute(
+                            "UPDATE shopping_lists SET updated_at = ?1 WHERE id = ?2",
+                            params![newest_ts, list_id],
+                        )
+                        .map_err(|e| format!("Greska azuriranja vremena popisa: {e}"))?;
+                        added_lists += 1;
+                    }
+                }
             }
         }
 
-        let _ = auto_compact(&self.conn, CompactionPolicy::default());
+        self.capture_existing(&tx)?;
+        tx.commit()
+            .map_err(|e| format!("Greska potvrde uvoza paketa: {e}"))?;
+
         Ok((added_stores, merged_products, added_lists))
     }
 }
@@ -952,11 +1269,12 @@ mod tests {
     }
 
     #[test]
-    fn saves_receipt_and_shopping_list() {
+    fn saves_receipt_atomically_and_recalculates_totals_consistently() {
         let db = Database::open_in_memory().expect("db");
         let stores = db.list_stores().expect("stores");
         let store_id = stores[0].id;
 
+        // Caller passes an inconsistent total_cents (999) for 2 * 149 = 298
         let items = vec![CartItem {
             id: "1".to_owned(),
             barcode: "3850102123".to_owned(),
@@ -964,14 +1282,21 @@ mod tests {
             quantity: 2.0,
             unit: Unit::Kom,
             unit_price_cents: 149,
-            total_cents: 298,
+            total_cents: 999,
             image_data_url: None,
         }];
 
         let receipt = db
             .save_receipt(store_id, "Super Konzum", &items, 298)
             .expect("save receipt");
+        assert_eq!(receipt.cart_total_cents, 298);
+        assert_eq!(receipt.items[0].total_cents, 298);
         assert_eq!(receipt.difference_cents, 0);
+
+        let stored = db.list_receipts().expect("list receipts");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].cart_total_cents, 298);
+        assert_eq!(stored[0].items[0].total_cents, 298);
 
         let list = db
             .create_shopping_list("Tjedna nabavka", Some(store_id))
@@ -988,9 +1313,9 @@ mod tests {
     }
 
     #[test]
-    fn exports_and_merges_sync_bundle_without_duplicates() {
+    fn exports_and_merges_sync_bundle_with_receipts_and_list_updates() {
         let db1 = Database::open_in_memory().expect("db1");
-        db1.add_store("Plodine", "Split", "#EF4444").expect("store");
+        let plodine = db1.add_store("Plodine", "Split", "#EF4444").expect("store");
         db1.upsert_product(&UpsertProductInput {
             barcode: "385111222333",
             name: "Kava 250g",
@@ -1001,23 +1326,106 @@ mod tests {
             image_data_url: None,
         })
         .expect("prod");
+        db1.save_receipt(
+            plodine.id,
+            "Plodine",
+            &[CartItem {
+                id: "1".to_owned(),
+                barcode: "385111222333".to_owned(),
+                name: "Kava 250g".to_owned(),
+                quantity: 1.0,
+                unit: Unit::Kom,
+                unit_price_cents: 340,
+                total_cents: 340,
+                image_data_url: None,
+            }],
+            340,
+        )
+        .expect("save receipt");
+
         let l = db1
-            .create_shopping_list("Subota", None)
+            .create_shopping_list("Subota", Some(plodine.id))
             .expect("create list");
-        db1.add_planned_item(l.id, Some("385111222333"), "Kava 250g", 1.0, Unit::Kom, 340)
+        let item1 = db1
+            .add_planned_item(l.id, Some("385111222333"), "Kava 250g", 1.0, Unit::Kom, 340)
             .expect("item");
 
         let bundle = db1.export_sync_bundle().expect("export");
+        assert_eq!(bundle.receipts.len(), 1);
 
         let db2 = Database::open_in_memory().expect("db2");
         let (s1, p1, l1) = db2.import_sync_bundle(&bundle).expect("import 1");
-        assert_eq!(s1, 1);
+        assert_eq!(s1, bundle.stores.len());
         assert_eq!(p1, 1);
         assert_eq!(l1, 1);
+        assert_eq!(db2.list_receipts().expect("receipts on db2").len(), 1);
 
-        // Importing again should be idempotent (no duplicate stores or lists)
+        // Importing the identical bundle again should be idempotent
         let (s2, _p2, l2) = db2.import_sync_bundle(&bundle).expect("import 2");
         assert_eq!(s2, 0);
         assert_eq!(l2, 0);
+        assert_eq!(db2.list_receipts().expect("receipts still 1").len(), 1);
+
+        // Now modify the existing list on db1 (toggle item1 + add a second item) and re-export
+        db1.toggle_planned_item(item1.id, true)
+            .expect("toggle item1");
+        db1.add_planned_item(l.id, None, "Mlijeko", 2.0, Unit::L, 110)
+            .expect("add item2");
+
+        let updated_bundle = db1.export_sync_bundle().expect("export updated");
+        let (_s3, _p3, l3) = db2
+            .import_sync_bundle(&updated_bundle)
+            .expect("import updated");
+        assert_eq!(l3, 1);
+
+        let db2_lists = db2.list_shopping_lists().expect("db2 lists");
+        assert_eq!(db2_lists.len(), 1);
+        assert_eq!(db2_lists[0].items.len(), 2);
+        let kava = db2_lists[0]
+            .items
+            .iter()
+            .find(|i| i.name == "Kava 250g")
+            .expect("kava item");
+        assert!(kava.checked);
+    }
+
+    #[test]
+    fn family_export_filters_by_shared_lists_and_excludes_receipts() {
+        let db = Database::open_in_memory().expect("db");
+        let stores = db.list_stores().expect("stores");
+        let konzum = &stores[0];
+        let lidl = &stores[2];
+
+        let l1 = db
+            .create_shopping_list("Obiteljska subota", Some(konzum.id))
+            .expect("l1");
+        db.add_planned_item(l1.id, None, "Kruh", 1.0, Unit::Kom, 150)
+            .expect("i1");
+
+        let l2 = db
+            .create_shopping_list("Osobni popis", Some(lidl.id))
+            .expect("l2");
+        db.add_planned_item(l2.id, None, "Tajni poklon", 1.0, Unit::Kom, 5000)
+            .expect("i2");
+
+        db.save_receipt(konzum.id, &konzum.name, &[], 0)
+            .expect("receipt");
+        db.add_member(
+            "Ana",
+            PeerRole::FamilyMember,
+            "482-915",
+            "Obiteljska subota",
+        )
+        .expect("add family member");
+
+        let fam_bundle = db
+            .export_sync_bundle_for_role(PeerRole::FamilyMember)
+            .expect("family export");
+
+        assert!(fam_bundle.receipts.is_empty());
+        assert_eq!(fam_bundle.lists.len(), 1);
+        assert_eq!(fam_bundle.lists[0].name, "Obiteljska subota");
+        assert_eq!(fam_bundle.stores.len(), 1);
+        assert_eq!(fam_bundle.stores[0].name, konzum.name);
     }
 }

@@ -17,6 +17,7 @@ list2cart-core = { path = "../crates/list2cart-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["time"] }
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2"

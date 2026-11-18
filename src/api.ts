@@ -18,14 +18,53 @@ import type {
 
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+export interface PriceSource {chain:string;label:string;url:string;price_date:string;}
+export interface RetailProduct {name:string;barcode:string|null;brand:string;package:string;price_cents:number;}
+export interface RetailResults {source:PriceSource;fetched_at:string;products:RetailProduct[];total_matches:number;}
+export interface CsvMapping {delimiter:number;name:number;price:number;barcode:number|null;brand:number|null;quantity:number|null;unit:number|null;}
+export interface CsvInspection {headers:string[];sample:string[][];delimiter:number;suggested:CsvMapping|null;}
+export async function inspectPriceCsv(bytes:number[]):Promise<CsvInspection> {
+  return invoke<CsvInspection>("inspect_price_csv",{bytes});
+}
+export async function readPriceCsv(bytes:number[],mapping:CsvMapping):Promise<RetailProduct[]> {
+  return invoke<RetailProduct[]>("read_price_csv",{bytes,mapping});
+}
+export async function retailSources(chain:string):Promise<PriceSource[]> {
+  return invoke<PriceSource[]>("retail_sources",{chain});
+}
+export async function retailSearch(sourceUrl:string,query:string):Promise<RetailResults> {
+  return invoke<RetailResults>("retail_search",{sourceUrl,query});
+}
+
+export interface IdentityConflict {
+  entity: "stores" | "products";
+  value: string;
+  sync_ids: string[];
+}
+
+export async function identityConflicts(): Promise<IdentityConflict[]> {
+  if (!isTauri()) return [];
+  return invoke<IdentityConflict[]>("identity_conflicts");
+}
+
+export async function resolveIdentityConflict(group: IdentityConflict, keepId: string): Promise<void> {
+  return invoke<void>("resolve_identity_conflict", { entity: group.entity, keepId, expectedIds: group.sync_ids });
+}
+
 export function formatCents(cents: number): string {
-  return (cents / 100).toFixed(2).replace(".", ",") + " €";
+  if (!Number.isSafeInteger(cents)) return "—";
+  const value = BigInt(cents < 0 ? -cents : cents);
+  return `${cents < 0 ? "-" : ""}${value / 100n},${(value % 100n).toString().padStart(2, "0")} €`;
 }
 
 export function calcLineCents(qty: number, unit: Unit, priceCents: number): number {
-  if (qty <= 0 || priceCents <= 0) return 0;
-  const eff = unit === "g" || unit === "ml" ? qty / 1000 : qty;
-  return Math.round(eff * priceCents);
+  const millis = Math.round(qty * 1000);
+  if (!Number.isFinite(qty) || millis <= 0 || millis > 1_000_000_000_000
+    || Math.abs(millis / 1000 - qty) > 0.0000001
+    || !Number.isSafeInteger(priceCents) || priceCents < 0) return 0;
+  const denominator = unit === "g" || unit === "ml" ? 1_000_000n : 1000n;
+  const cents = (BigInt(millis) * BigInt(priceCents) + denominator / 2n) / denominator;
+  return cents <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(cents) : 0;
 }
 
 export async function listStores(): Promise<Store[]> {
@@ -108,6 +147,11 @@ export async function listReceipts(): Promise<ReceiptSummary[]> {
   return invoke<ReceiptSummary[]>("list_receipts");
 }
 
+export async function incompleteReceiptCount(): Promise<number> {
+  if (!isTauri()) return 0;
+  return invoke<number>("incomplete_receipt_count");
+}
+
 export async function exportReceiptXlsx(receipt: ReceiptSummary): Promise<string> {
   return invoke<string>("export_receipt_xlsx", { receipt });
 }
@@ -160,12 +204,23 @@ export async function syncPocketbase(url: string, authToken?: string | null): Pr
   return invoke<SyncReport>("sync_pocketbase", { url, authToken: authToken ?? null });
 }
 
-export async function exportSyncBundleJson(role: PeerRole = "own_device"): Promise<string> {
-  return invoke<string>("export_sync_bundle_json", { role });
+export async function exportSyncBundleJson(
+  role: PeerRole = "own_device",
+  sharedLists?: string | null,
+): Promise<string> {
+  return invoke<string>("export_sync_bundle_json", {
+    role,
+    sharedLists: sharedLists ?? null,
+  });
 }
 
 export async function importSyncBundleJson(jsonStr: string): Promise<[number, number, number]> {
   return invoke<[number, number, number]>("import_sync_bundle_json", { jsonStr });
+}
+
+export async function saveSyncPackage(json: string, familyOnly: boolean): Promise<string | null> {
+  if (!isTauri()) return null;
+  return invoke<string>("save_sync_bundle_file", {jsonStr:json,familyOnly});
 }
 
 export async function getLedgerStats(): Promise<LedgerStats> {
