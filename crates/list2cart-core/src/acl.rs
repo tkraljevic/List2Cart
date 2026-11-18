@@ -38,7 +38,6 @@ pub(crate) fn historical_membership(
 ) -> Result<Option<syncnet::trust::Membership>, String> {
     let mut newest: Option<syncnet::trust::Membership> = None;
     let mut seen_issued = std::collections::BTreeMap::<i64, Vec<u8>>::new();
-    let mut seen_principal: Option<String> = None;
     for raw in control_history(conn, "membership", key)? {
         let crate::models::ControlPayload::Membership(member) =
             serde_json::from_str(&raw).map_err(|e| format!("Neispravan povijesni dokaz: {e}"))?
@@ -55,13 +54,6 @@ pub(crate) fn historical_membership(
             }
         } else {
             seen_issued.insert(member.issued_at, signed);
-        }
-        if let Some(ref principal) = seen_principal {
-            if *principal != member.principal_id {
-                return Err("Povijesno članstvo ne smije promijeniti principal".into());
-            }
-        } else {
-            seen_principal = Some(member.principal_id.clone());
         }
         if member.issued_at <= at
             && newest
@@ -84,6 +76,66 @@ pub(crate) fn historical_membership(
         return Ok(None);
     }
     Ok(Some(member))
+}
+
+pub(crate) fn historical_member_role(
+    conn: &Connection,
+    network: &ed25519_dalek::VerifyingKey,
+    key: &str,
+    at: i64,
+) -> Result<Option<crate::acl_types::MemberRoleRecord>, String> {
+    let mut newest: Option<crate::acl_types::MemberRoleRecord> = None;
+    let mut seen_issued = std::collections::BTreeMap::<i64, Vec<u8>>::new();
+    let mut seen_principal: Option<String> = None;
+    for raw in control_history(conn, "member_role", key)? {
+        let crate::models::ControlPayload::MemberRole(role_rec) =
+            serde_json::from_str(&raw).map_err(|e| format!("Neispravan povijesni dokaz: {e}"))?
+        else {
+            continue;
+        };
+        if role_rec.device_key != key {
+            continue;
+        }
+        let signed = role_rec.signed_bytes();
+        if let Some(prev) = seen_issued.get(&role_rec.issued_at) {
+            if *prev != signed {
+                return Err("Dvosmislena povijesna uloga članstva".into());
+            }
+        } else {
+            seen_issued.insert(role_rec.issued_at, signed);
+        }
+        if let Some(ref principal) = seen_principal {
+            if *principal != role_rec.principal_id {
+                return Err("Povijesno članstvo ne smije promijeniti principal".into());
+            }
+        } else {
+            seen_principal = Some(role_rec.principal_id.clone());
+        }
+        if role_rec.issued_at <= at
+            && newest
+                .as_ref()
+                .is_none_or(|old| role_rec.issued_at > old.issued_at)
+        {
+            newest = Some(role_rec);
+        }
+    }
+    let Some(role_rec) = newest else {
+        return Ok(None);
+    };
+    let public = syncnet::identity::parse_public_key(key).map_err(|e| e.to_string())?;
+    if role_rec.verify(network, &public, at).is_err()
+        || check_delegation_at(
+            conn,
+            network,
+            role_rec.admitter.as_ref(),
+            role_rec.issued_at,
+        )
+        .is_err()
+        || revoked(conn, "membership", key, &role_rec.device_id)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(role_rec))
 }
 
 pub(crate) fn historical_admin(
@@ -152,13 +204,14 @@ pub(crate) struct ControlIdentity<'a> {
 /// False means an older signed proof may be retained in the ledger, but cannot
 /// replace the current authority. Grant IDs and principal bindings are immutable.
 pub(crate) fn may_store(conn: &Connection, value: ControlIdentity<'_>) -> Result<bool, String> {
-    if matches!(value.kind, "membership" | "ovlast") {
+    if matches!(value.kind, "membership" | "member_role" | "ovlast") {
         for raw in control_history(conn, value.kind, value.subject)? {
             let previous: crate::models::ControlPayload = serde_json::from_str(&raw)
                 .map_err(|e| format!("Neispravan povijesni dokaz: {e}"))?;
             let (issued, same_target) = match previous {
-                crate::models::ControlPayload::Membership(m) => {
-                    (m.issued_at, m.principal_id == value.target)
+                crate::models::ControlPayload::Membership(m) => (m.issued_at, true),
+                crate::models::ControlPayload::MemberRole(r) => {
+                    (r.issued_at, r.principal_id == value.target)
                 }
                 crate::models::ControlPayload::Ovlast(o) => {
                     (o.issued_at, o.device_id == value.target)

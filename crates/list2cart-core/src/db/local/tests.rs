@@ -415,19 +415,25 @@ fn product_resolution_allows_future_writes_only_to_the_chosen_identity() {
 fn join_for_test(source: &Database) -> Database {
     let key = generate_signing_key();
     let root = source.identity.network_key.as_ref().unwrap();
-    let membership = NetworkKey::from_signing_key("test", root.clone())
-        .admit_member(
-            &verifying_key_to_base64(&key.verifying_key()),
-            &key.verifying_key(),
-            MemberRole::OwnDevice,
-            &source.identity.principal,
-            "root",
-            Validity {
-                issued_at: Utc::now().timestamp(),
-                valid_for_secs: 3600,
-            },
-        )
+    let net = NetworkKey::from_signing_key("test", root.clone());
+    let validity = Validity {
+        issued_at: Utc::now().timestamp(),
+        valid_for_secs: 3600,
+    };
+    let dev_b64 = verifying_key_to_base64(&key.verifying_key());
+    let membership = net
+        .admit_member(&dev_b64, &key.verifying_key(), "root", validity)
         .unwrap();
+    let role_rec = crate::acl_types::issue_member_role(
+        &net,
+        &dev_b64,
+        &key.verifying_key(),
+        crate::acl_types::MemberRole::OwnDevice,
+        &source.identity.principal,
+        "root",
+        validity,
+    )
+    .unwrap();
     let db = Database {
         conn: Connection::open_in_memory().unwrap(),
         identity: LocalIdentity {
@@ -440,20 +446,23 @@ fn join_for_test(source: &Database) -> Database {
     };
     db.init_schema().unwrap();
     let control = ControlPayload::Membership(membership);
-    store_control_record(
-        &db.conn,
-        &source.identity.network_public,
-        &control,
-        Utc::now().timestamp(),
-    )
-    .unwrap();
-    store_control_record(
-        &source.conn,
-        &source.identity.network_public,
-        &control,
-        Utc::now().timestamp(),
-    )
-    .unwrap();
+    let role_control = ControlPayload::MemberRole(role_rec);
+    for ctrl in [&control, &role_control] {
+        store_control_record(
+            &db.conn,
+            &source.identity.network_public,
+            ctrl,
+            Utc::now().timestamp(),
+        )
+        .unwrap();
+        store_control_record(
+            &source.conn,
+            &source.identity.network_public,
+            ctrl,
+            Utc::now().timestamp(),
+        )
+        .unwrap();
+    }
     record_signed_version(
         &source.conn,
         &source.sync_identity().network_public_key,
@@ -466,8 +475,43 @@ fn join_for_test(source: &Database) -> Database {
         "",
     )
     .unwrap();
+    record_signed_version(
+        &source.conn,
+        &source.sync_identity().network_public_key,
+        root,
+        "member_role",
+        &format!("member_role:{}", db.sync_identity().device_public_key),
+        false,
+        &serde_json::to_string(&role_control).unwrap(),
+        "control",
+        "",
+    )
+    .unwrap();
     db.initialize_local_identity().unwrap();
     db
+}
+
+fn copy_membership_and_role(from: &Database, to: &Database, subject_key: &str) {
+    for kind in ["membership", "member_role"] {
+        if let Some(raw) = from
+            .conn
+            .query_row(
+                "SELECT raw_json FROM sync_trust_records WHERE kind=?1 AND subject_key=?2",
+                params![kind, subject_key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+        {
+            store_control_record(
+                &to.conn,
+                &from.identity.network_public,
+                &serde_json::from_str::<ControlPayload>(&raw).unwrap(),
+                Utc::now().timestamp(),
+            )
+            .unwrap();
+        }
+    }
 }
 
 fn transfer(source: &Database, destination: &Database) -> crate::apply::ApplyReport {
@@ -498,14 +542,7 @@ fn relay_with_a_lower_local_max_still_sends_an_arrival_below_the_recipients_max(
     let destination_key = destination.sync_identity().device_public_key;
     for db in [&relay, &destination] {
         for key in [&author, &relay_key, &destination_key] {
-            let raw:String=original.conn.query_row("SELECT raw_json FROM sync_trust_records WHERE kind='membership' AND subject_key=?1",[key],|r|r.get(0)).unwrap();
-            store_control_record(
-                &db.conn,
-                &original.identity.network_public,
-                &serde_json::from_str::<ControlPayload>(&raw).unwrap(),
-                Utc::now().timestamp(),
-            )
-            .unwrap();
+            copy_membership_and_role(&original, db, key);
         }
     }
     let list = original
@@ -625,14 +662,7 @@ fn late_older_record_reaches_a_third_device_even_after_a_high_frontier_was_confi
     // Pairing has already established the three synthetic memberships.
     for db in [&relay, &destination] {
         for key in [&original_key, &relay_key, &destination_key] {
-            let raw:String=original.conn.query_row("SELECT raw_json FROM sync_trust_records WHERE kind='membership' AND subject_key=?1",[key],|r|r.get(0)).unwrap();
-            store_control_record(
-                &db.conn,
-                &original.identity.network_public,
-                &serde_json::from_str::<ControlPayload>(&raw).unwrap(),
-                Utc::now().timestamp(),
-            )
-            .unwrap();
+            copy_membership_and_role(&original, db, key);
         }
     }
     let list = original
@@ -936,21 +966,7 @@ fn automatic_exchange_rejects_forged_requests_and_unrelated_failures_do_not_star
     let destination = join_for_test(&source);
     let sender = source.sync_identity().device_public_key;
     let recipient = destination.sync_identity().device_public_key;
-    let membership: String = source
-        .conn
-        .query_row(
-            "SELECT raw_json FROM sync_trust_records WHERE kind='membership' AND subject_key=?1",
-            [&sender],
-            |r| r.get(0),
-        )
-        .unwrap();
-    store_control_record(
-        &destination.conn,
-        &source.identity.network_public,
-        &serde_json::from_str::<ControlPayload>(&membership).unwrap(),
-        Utc::now().timestamp(),
-    )
-    .unwrap();
+    copy_membership_and_role(&source, &destination, &sender);
     let request = destination.sync_request(&sender).unwrap();
     let mut forged = request.clone();
     forged
@@ -1033,21 +1049,7 @@ fn automatic_exchange_chooses_recovery_resumes_after_restart_and_returns_to_delt
     let destination = join_for_test(&source);
     let sender = source.sync_identity().device_public_key;
     let recipient = destination.sync_identity().device_public_key;
-    let membership: String = source
-        .conn
-        .query_row(
-            "SELECT raw_json FROM sync_trust_records WHERE kind='membership' AND subject_key=?1",
-            [&sender],
-            |r| r.get(0),
-        )
-        .unwrap();
-    store_control_record(
-        &destination.conn,
-        &source.identity.network_public,
-        &serde_json::from_str::<ControlPayload>(&membership).unwrap(),
-        Utc::now().timestamp(),
-    )
-    .unwrap();
+    copy_membership_and_role(&source, &destination, &sender);
     destination
         .conn
         .execute("VACUUM INTO ?1", [destination_path.to_str().unwrap()])
@@ -1217,21 +1219,7 @@ fn automatic_exchange_replaces_lost_outgoing_state_without_resuming_an_abandoned
     let destination = join_for_test(&source);
     let sender = source.sync_identity().device_public_key;
     let recipient = destination.sync_identity().device_public_key;
-    let membership: String = source
-        .conn
-        .query_row(
-            "SELECT raw_json FROM sync_trust_records WHERE kind='membership' AND subject_key=?1",
-            [&sender],
-            |r| r.get(0),
-        )
-        .unwrap();
-    store_control_record(
-        &destination.conn,
-        &source.identity.network_public,
-        &serde_json::from_str::<ControlPayload>(&membership).unwrap(),
-        Utc::now().timestamp(),
-    )
-    .unwrap();
+    copy_membership_and_role(&source, &destination, &sender);
     let list = source
         .create_shopping_list("Replace interrupted snapshot", None)
         .unwrap();
@@ -1317,21 +1305,7 @@ fn snapshot_preserves_newer_local_edits_and_rechecks_own_device_permissions() {
     let destination = join_for_test(&source);
     let recipient = destination.sync_identity().device_public_key;
     let sender = source.sync_identity().device_public_key;
-    let membership: String = source
-        .conn
-        .query_row(
-            "SELECT raw_json FROM sync_trust_records WHERE kind='membership' AND subject_key=?1",
-            [&sender],
-            |r| r.get(0),
-        )
-        .unwrap();
-    store_control_record(
-        &destination.conn,
-        &source.identity.network_public,
-        &serde_json::from_str::<ControlPayload>(&membership).unwrap(),
-        Utc::now().timestamp(),
-    )
-    .unwrap();
+    copy_membership_and_role(&source, &destination, &sender);
     let list = source
         .create_shopping_list("Keep newer edit", None)
         .unwrap();
@@ -1468,21 +1442,11 @@ fn snapshot_pages_resume_after_both_databases_reopen_and_commit_only_at_completi
     let destination_path = dir.0.join("snapshot-recipient.sqlite");
     let source = Database::open(&source_path).unwrap();
     let destination = join_for_test(&source);
-    let membership: String = source
-        .conn
-        .query_row(
-            "SELECT raw_json FROM sync_trust_records WHERE kind='membership' AND subject_key=?1",
-            [source.sync_identity().device_public_key],
-            |r| r.get(0),
-        )
-        .unwrap();
-    store_control_record(
-        &destination.conn,
-        &source.identity.network_public,
-        &serde_json::from_str::<ControlPayload>(&membership).unwrap(),
-        Utc::now().timestamp(),
-    )
-    .unwrap();
+    copy_membership_and_role(
+        &source,
+        &destination,
+        &source.sync_identity().device_public_key,
+    );
     destination
         .conn
         .execute("VACUUM INTO ?1", [destination_path.to_str().unwrap()])
@@ -1729,21 +1693,11 @@ fn database_protected_bundle_round_trip_replay_and_tamper_rejection() {
     let source = Database::open_in_memory().unwrap();
     let destination = join_for_test(&source);
     // Pairing must establish the sender's membership before private data admission.
-    let sender_membership: String = source
-        .conn
-        .query_row(
-            "SELECT raw_json FROM sync_trust_records WHERE kind='membership' AND subject_key=?1",
-            [&source.sync_identity().device_public_key],
-            |row| row.get(0),
-        )
-        .unwrap();
-    store_control_record(
-        &destination.conn,
-        &source.identity.network_public,
-        &serde_json::from_str::<ControlPayload>(&sender_membership).unwrap(),
-        Utc::now().timestamp(),
-    )
-    .unwrap();
+    copy_membership_and_role(
+        &source,
+        &destination,
+        &source.sync_identity().device_public_key,
+    );
     source.create_shopping_list("Privatni popis", None).unwrap();
     let bundle = source
         .export_protected_bundle(
@@ -1818,7 +1772,7 @@ fn actual_local_commands_produce_full_signed_snapshots_and_replicate() {
             payload: v.payload.clone(),
             signature: v.signature.clone(),
         };
-        env.verify_signature().unwrap();
+        env.verify_signature(crate::apply::PROTOCOL_NAME).unwrap();
         if v.channel != "control" {
             assert_eq!(v.channel, format!("private:{}", a.identity.principal));
             validate_payload_syntax_only(v).unwrap();
@@ -2388,8 +2342,10 @@ fn local_writes_after_a_future_peer_keep_order_time_and_independent_ids() {
     env.version_id = Uuid::from_bytes(bytes).to_string();
     env.created_at = future.to_rfc3339();
     env.created_at_unix = future.timestamp();
-    let v: Version =
-        serde_json::from_value(serde_json::to_value(env.sign(&a.identity.key)).unwrap()).unwrap();
+    let v: Version = serde_json::from_value(
+        serde_json::to_value(env.sign(crate::apply::PROTOCOL_NAME, &a.identity.key)).unwrap(),
+    )
+    .unwrap();
     for db in [&a, &b] {
         let recipient = db.sync_identity().device_public_key;
         let report = apply_remote_versions(
@@ -2441,7 +2397,7 @@ fn unsigned_legacy_future_uuid_cannot_poison_the_signed_clock() {
 
 #[test]
 fn local_shared_list_mutation_requires_write_grant_and_inherits_the_channel() {
-    use syncnet::trust::ListPermission;
+    use crate::acl_types::ListPermission;
     let db = Database::open_in_memory().unwrap();
     let scratch = Database::open_in_memory().unwrap();
     let network =
@@ -2450,19 +2406,19 @@ fn local_shared_list_mutation_requires_write_grant_and_inherits_the_channel() {
     let id = "shared-test-list";
     let channel = format!("list:{id}");
     let grant = |permission, grant_id| {
-        let g = network
-            .issue_list_grant(
-                grant_id,
-                id,
-                &db.identity.key.verifying_key(),
-                permission,
-                "root",
-                Validity {
-                    issued_at: Utc::now().timestamp(),
-                    valid_for_secs: 3600,
-                },
-            )
-            .unwrap();
+        let g = crate::acl_types::issue_list_grant(
+            &network,
+            grant_id,
+            id,
+            &db.identity.key.verifying_key(),
+            permission,
+            "root",
+            Validity {
+                issued_at: Utc::now().timestamp(),
+                valid_for_secs: 3600,
+            },
+        )
+        .unwrap();
         store_control_record(
             &db.conn,
             &network.public,
@@ -2523,21 +2479,7 @@ fn import_sync_package_json_routes_encrypted_v2_and_legacy_v1_cleanly() {
     let source = Database::open_in_memory().unwrap();
     let replica = join_for_test(&source);
     let sender = source.sync_identity().device_public_key;
-    let membership: String = source
-        .conn
-        .query_row(
-            "SELECT raw_json FROM sync_trust_records WHERE kind='membership' AND subject_key=?1",
-            [&sender],
-            |r| r.get(0),
-        )
-        .unwrap();
-    store_control_record(
-        &replica.conn,
-        &source.identity.network_public,
-        &serde_json::from_str::<ControlPayload>(&membership).unwrap(),
-        Utc::now().timestamp(),
-    )
-    .unwrap();
+    copy_membership_and_role(&source, &replica, &sender);
     let store = source.add_store("V2 Dućan", "Split", "#1768D1").unwrap();
     let list = source
         .create_shopping_list("V2 Tjedni popis", Some(store.id))
@@ -2838,8 +2780,8 @@ fn unilateral_finish_recovery_recovers_via_tls_credentials_and_idempotent_repair
         .prepare_welcome_pack(&c_key_bytes, PeerRole::FamilyMember, "*", true)
         .unwrap();
     assert_eq!(
-        welcome_c1.for_you.as_ref().unwrap().principal_id,
-        welcome_c2.for_you.as_ref().unwrap().principal_id
+        welcome_c1.role_for_you.as_ref().unwrap().principal_id,
+        welcome_c2.role_for_you.as_ref().unwrap().principal_id
     );
     let out_c = joiner_c
         .finalize_pairing(

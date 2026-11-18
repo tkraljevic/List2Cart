@@ -163,8 +163,6 @@ fn automatic_family_grant_expiry_replaces_partial_data_with_control_only_snapsho
             .admit_member(
                 "family",
                 &reader.verifying_key(),
-                MemberRole::FamilyMember,
-                "family-principal",
                 "root",
                 Validity {
                     issued_at: f.now - 5,
@@ -1250,9 +1248,10 @@ fn family_revocation_and_new_grant_are_replayed_even_above_old_control_frontier(
 
 #[test]
 fn family_delegation_proof_precedes_envelopes_even_with_later_wrapper_uuid() {
+    use crate::acl_types::ListGrant;
     use base64::{Engine, engine::general_purpose::STANDARD};
     use ed25519_dalek::Signer;
-    use syncnet::trust::{ListGrant, Membership};
+    use syncnet::trust::Membership;
     let source = Database::open_in_memory().unwrap();
     let destination = Database::open_in_memory().unwrap();
     let f = Fixture::new();
@@ -1275,8 +1274,6 @@ fn family_delegation_proof_precedes_envelopes_even_with_later_wrapper_uuid() {
             authority.clone(),
             "writer",
             &writer.verifying_key(),
-            MemberRole::FamilyMember,
-            "writer-principal",
             Validity {
                 issued_at: f.now - 20,
                 valid_for_secs: 1000,
@@ -1372,8 +1369,6 @@ fn family_foreign_own_device_does_not_receive_private_data_or_global_control_ack
             .admit_member(
                 "reader",
                 &reader.verifying_key(),
-                MemberRole::OwnDevice,
-                "family-principal",
                 "root",
                 Validity {
                     issued_at: f.now - 5,

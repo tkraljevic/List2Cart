@@ -25,6 +25,7 @@ impl Needed {
     ) -> bool {
         match ctrl {
             ControlPayload::Membership(m) => self.members.contains(&m.device_key),
+            ControlPayload::MemberRole(r) => self.members.contains(&r.device_key),
             ControlPayload::Ovlast(o) => self.admins.contains(&o.device_key),
             ControlPayload::ListGrant(g) => {
                 g.recipient_pub_key == recipient
@@ -49,6 +50,7 @@ impl Needed {
     fn extend(&mut self, ctrl: &ControlPayload, root: &str) {
         let admin = match ctrl {
             ControlPayload::Membership(m) => m.admitter.as_ref(),
+            ControlPayload::MemberRole(r) => r.admitter.as_ref(),
             ControlPayload::ListGrant(g) => {
                 self.grants.insert(g.grant_id.clone());
                 g.admitter.as_ref()

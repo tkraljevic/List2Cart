@@ -1,4 +1,5 @@
 use crate::{
+    acl_types::{ListGrant, MemberRole, MemberRoleRecord, issue_member_role},
     apply::{store_control_record, verify_domain_version_auth},
     ledger::{PeerRole, Version, record_signed_version},
     models::ControlPayload,
@@ -11,7 +12,7 @@ use std::{collections::BTreeMap, net::SocketAddr, sync::Mutex};
 use syncnet::{
     identity::{parse_public_key, principal_id_from_key, public_key_to_base64},
     pairing::{PairHello, PairIdentity, PairingSessionSlot, reject_pending_in_background},
-    trust::{ListGrant, MemberRole, Membership, NetworkKey, Ovlast, Validity},
+    trust::{Membership, NetworkKey, Ovlast, Validity},
 };
 
 pub const DEFAULT_MEMBERSHIP_VALIDITY_SECS: i64 = 365 * 24 * 3600;
@@ -21,6 +22,8 @@ pub const DEFAULT_MEMBERSHIP_VALIDITY_SECS: i64 = 365 * 24 * 3600;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCredentials {
     pub membership: Membership,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_role: Option<MemberRoleRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ovlast: Option<Ovlast>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -41,7 +44,11 @@ pub struct WelcomePack {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mine: Option<Membership>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub my_role: Option<MemberRoleRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_you: Option<Membership>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_for_you: Option<MemberRoleRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ovlast: Option<Ovlast>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -125,6 +132,42 @@ fn load_active_membership(
         return Ok(None);
     }
     Ok(Some(m))
+}
+
+fn load_active_member_role(
+    conn: &Connection,
+    network_pub: &VerifyingKey,
+    subject_b64: &str,
+    now_unix: i64,
+) -> Result<Option<MemberRoleRecord>, String> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT raw_json FROM sync_trust_records
+             WHERE kind = 'member_role' AND subject_key = ?1 AND revoked = 0
+               AND issued_at <= ?2 AND (expires_at = 0 OR expires_at >= ?2)
+             ORDER BY issued_at DESC LIMIT 1",
+            params![subject_b64, now_unix],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("Greska citanja uloge clanstva: {e}"))?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let ControlPayload::MemberRole(r) = serde_json::from_str(&raw)
+        .map_err(|e| format!("Neispravna spremljena uloga clanstva: {e}"))?
+    else {
+        return Ok(None);
+    };
+    let vk = parse_public_key(subject_b64).map_err(|e| e.to_string())?;
+    if r.verify(network_pub, &vk, now_unix).is_err()
+        || crate::acl::check_delegation_at(conn, network_pub, r.admitter.as_ref(), r.issued_at)
+            .is_err()
+        || crate::acl::revoked(conn, "membership", subject_b64, &r.device_id)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(r))
 }
 
 fn load_active_ovlast(
@@ -253,8 +296,18 @@ pub fn build_tls_credentials(ctx: &PairingContext<'_>) -> Result<Option<Vec<u8>>
         control_versions.push(v);
     }
 
+    let member_role = load_active_member_role(ctx.conn, ctx.network_pub, &device_b64, now)?;
+    if let Some(v) = load_control_version_for_entity(
+        ctx.conn,
+        "member_role",
+        &format!("member_role:{device_b64}"),
+    )? {
+        control_versions.push(v);
+    }
+
     let creds = NodeCredentials {
         membership,
+        member_role,
         ovlast,
         grants,
         control_versions,
@@ -295,6 +348,7 @@ pub fn prepare_welcome_pack(
 
     let network_b64 = public_key_to_base64(ctx.network_pub.as_bytes());
     let mine = load_active_membership(ctx.conn, ctx.network_pub, &our_b64, now)?;
+    let my_role = load_active_member_role(ctx.conn, ctx.network_pub, &our_b64, now)?;
     let our_ovlast = load_active_ovlast(ctx.conn, ctx.network_pub, &our_b64, now)?;
 
     let mut pack = WelcomePack {
@@ -302,7 +356,9 @@ pub fn prepare_welcome_pack(
         network_key: network_b64,
         principal_id: ctx.principal.to_owned(),
         mine,
+        my_role,
         for_you: None,
+        role_for_you: None,
         ovlast: our_ovlast.clone(),
         grants: Vec::new(),
         control_versions: Vec::new(),
@@ -310,6 +366,11 @@ pub fn prepare_welcome_pack(
 
     if let Some(v) =
         load_control_version_for_entity(ctx.conn, "membership", &format!("membership:{our_b64}"))?
+    {
+        pack.control_versions.push(v);
+    }
+    if let Some(v) =
+        load_control_version_for_entity(ctx.conn, "member_role", &format!("member_role:{our_b64}"))?
     {
         pack.control_versions.push(v);
     }
@@ -335,13 +396,23 @@ pub fn prepare_welcome_pack(
     // If the peer already has an active membership with the same role (e.g. unilateral finish retry),
     // reuse its principal_id and certificate so re-pairing is idempotent.
     if let Some(existing) = load_active_membership(ctx.conn, ctx.network_pub, &peer_b64, now)?
-        && existing.role == member_role
+        && let Some(existing_role) =
+            load_active_member_role(ctx.conn, ctx.network_pub, &peer_b64, now)?
+        && existing_role.role == member_role
     {
         pack.for_you = Some(existing);
+        pack.role_for_you = Some(existing_role);
         if let Some(v) = load_control_version_for_entity(
             ctx.conn,
             "membership",
             &format!("membership:{peer_b64}"),
+        )? {
+            pack.control_versions.push(v);
+        }
+        if let Some(v) = load_control_version_for_entity(
+            ctx.conn,
+            "member_role",
+            &format!("member_role:{peer_b64}"),
         )? {
             pack.control_versions.push(v);
         }
@@ -354,7 +425,7 @@ pub fn prepare_welcome_pack(
             let existing_principal: Option<String> = ctx
                 .conn
                 .query_row(
-                    "SELECT target_id FROM sync_trust_records WHERE kind = 'membership' AND subject_key = ?1 LIMIT 1",
+                    "SELECT target_id FROM sync_trust_records WHERE kind = 'member_role' AND subject_key = ?1 LIMIT 1",
                     params![peer_b64],
                     |r| r.get(0),
                 )
@@ -369,21 +440,39 @@ pub fn prepare_welcome_pack(
         valid_for_secs: DEFAULT_MEMBERSHIP_VALIDITY_SECS,
     };
 
-    let (for_you_member, signer_node, signer_sk) = if let Some(root_sk) = ctx.network_key {
+    let (for_you_member, for_you_role, signer_node, signer_sk) = if let Some(root_sk) =
+        ctx.network_key
+    {
         let net = NetworkKey::from_signing_key(ctx.network_name, root_sk.clone());
         let m = net
-            .admit_member(
-                &peer_b64,
-                &peer_vk,
-                member_role,
-                &target_principal,
-                "root",
-                validity,
-            )
+            .admit_member(&peer_b64, &peer_vk, "root", validity)
             .map_err(|e| e.to_string())?;
-        (m, public_key_to_base64(ctx.network_pub.as_bytes()), root_sk)
+        let r = issue_member_role(
+            &net,
+            &peer_b64,
+            &peer_vk,
+            member_role,
+            &target_principal,
+            "root",
+            validity,
+        )
+        .map_err(|e| e.to_string())?;
+        (
+            m,
+            r,
+            public_key_to_base64(ctx.network_pub.as_bytes()),
+            root_sk,
+        )
     } else if let Some(ovlast) = our_ovlast {
         let m = Membership::admit_as(
+            ctx.device_key,
+            ovlast.clone(),
+            &peer_b64,
+            &peer_vk,
+            validity,
+        )
+        .map_err(|e| e.to_string())?;
+        let r = MemberRoleRecord::admit_as(
             ctx.device_key,
             ovlast,
             &peer_b64,
@@ -393,7 +482,7 @@ pub fn prepare_welcome_pack(
             validity,
         )
         .map_err(|e| e.to_string())?;
-        (m, our_b64.clone(), ctx.device_key)
+        (m, r, our_b64.clone(), ctx.device_key)
     } else {
         return Err(
             "Ovaj uredjaj ne drzi mrezni kljuc ni aktivnu ovlast za primanje novih clanova".into(),
@@ -408,8 +497,18 @@ pub fn prepare_welcome_pack(
         &format!("membership:{peer_b64}"),
         &ControlPayload::Membership(for_you_member.clone()),
     )?;
+    let role_version = build_in_memory_control_version(
+        ctx.conn,
+        &signer_node,
+        signer_sk,
+        "member_role",
+        &format!("member_role:{peer_b64}"),
+        &ControlPayload::MemberRole(for_you_role.clone()),
+    )?;
     pack.for_you = Some(for_you_member);
+    pack.role_for_you = Some(for_you_role);
     pack.control_versions.push(ctrl_version);
+    pack.control_versions.push(role_version);
 
     Ok(pack)
 }
@@ -454,7 +553,7 @@ fn build_in_memory_control_version(
         payload: payload.clone(),
         signature: String::new(),
     }
-    .sign(sk);
+    .sign(crate::apply::PROTOCOL_NAME, sk);
 
     Ok(Version {
         version_id,
@@ -563,15 +662,23 @@ pub fn finalize_pairing_in_db(
                 "Druga strana nije izdala potvrdu clanstva za ulazak u njezinu mrezu".into(),
             );
         };
+        let Some(ref my_role_rec) = theirs.role_for_you else {
+            return Err(
+                "Druga strana nije izdala potvrdu uloge clanstva za ulazak u njezinu mrezu".into(),
+            );
+        };
         let new_net_vk = parse_public_key(&theirs.network_key).map_err(|e| e.to_string())?;
         for_me
             .verify(&new_net_vk, &ctx.device_key.verifying_key(), now)
             .map_err(|e| format!("Potvrda clanstva za ovaj uredjaj nije valjana: {e}"))?;
+        my_role_rec
+            .verify(&new_net_vk, &ctx.device_key.verifying_key(), now)
+            .map_err(|e| format!("Potvrda uloge clanstva za ovaj uredjaj nije valjana: {e}"))?;
 
-        let new_principal = for_me.principal_id.clone();
+        let new_principal = my_role_rec.principal_id.clone();
         let old_principal = ctx.principal.to_owned();
 
-        if for_me.role == MemberRole::OwnDevice && new_principal != old_principal {
+        if my_role_rec.role == MemberRole::OwnDevice && new_principal != old_principal {
             tx.execute(
                 "DELETE FROM stores
                  WHERE sync_id NOT IN (SELECT store_sync_id FROM receipts WHERE store_sync_id != '')
@@ -632,6 +739,12 @@ pub fn finalize_pairing_in_db(
             &ControlPayload::Membership(for_me.clone()),
             now,
         )?;
+        store_control_record(
+            &tx,
+            &new_net_vk,
+            &ControlPayload::MemberRole(my_role_rec.clone()),
+            now,
+        )?;
         if let Some(ref peer_m) = theirs.mine
             && peer_m.verify(&new_net_vk, &peer_vk, now).is_ok()
         {
@@ -641,6 +754,16 @@ pub fn finalize_pairing_in_db(
                 &ControlPayload::Membership(peer_m.clone()),
                 now,
             )?;
+            if let Some(ref peer_r) = theirs.my_role
+                && peer_r.verify(&new_net_vk, &peer_vk, now).is_ok()
+            {
+                store_control_record(
+                    &tx,
+                    &new_net_vk,
+                    &ControlPayload::MemberRole(peer_r.clone()),
+                    now,
+                )?;
+            }
             peer_is_member = true;
         } else if peer_b64 == theirs.network_key {
             peer_is_member = true;
@@ -652,7 +775,7 @@ pub fn finalize_pairing_in_db(
             insert_control_version_if_missing(&tx, cv)?;
         }
 
-        if for_me.role == MemberRole::OwnDevice {
+        if my_role_rec.role == MemberRole::OwnDevice {
             resign_local_domain_records(&tx, ctx.device_key, &new_net_vk, &new_principal, now)?;
         }
 
@@ -708,6 +831,10 @@ pub fn finalize_pairing_in_db(
         {
             let ctrl = ControlPayload::Membership(for_peer.clone());
             store_control_record(&tx, ctx.network_pub, &ctrl, now)?;
+            if let Some(ref role_for_peer) = our_pack.role_for_you {
+                let role_ctrl = ControlPayload::MemberRole(role_for_peer.clone());
+                store_control_record(&tx, ctx.network_pub, &role_ctrl, now)?;
+            }
             for cv in &our_pack.control_versions {
                 insert_control_version_if_missing(&tx, cv)?;
             }
@@ -909,6 +1036,17 @@ pub fn verify_or_recover_peer_access(
     .is_err()
     {
         return Ok(false);
+    }
+    if let Some(ref role_rec) = creds.member_role
+        && role_rec.device_key == peer_b64
+        && role_rec.verify(ctx.network_pub, &peer_vk, now).is_ok()
+    {
+        let _ = store_control_record(
+            &tx,
+            ctx.network_pub,
+            &ControlPayload::MemberRole(role_rec.clone()),
+            now,
+        );
     }
 
     let our_b64 = public_key_to_base64(ctx.device_key.verifying_key().as_bytes());

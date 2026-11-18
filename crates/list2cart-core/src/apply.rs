@@ -1,3 +1,4 @@
+use crate::acl_types::{ListPermission, MemberRole};
 use crate::calc::{MAX_SAFE_CENTS, checked_line_total_millis};
 use crate::ledger::{
     DeltaBatch, HoleRecord, Version, compute_delta_paged_filtered, get_confirmed_frontier,
@@ -13,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use syncnet::identity::{parse_public_key, public_key_to_base64};
-use syncnet::trust::{ListPermission, MAX_CLOCK_SKEW_SECS, MemberRole, SignedVersionEnvelope};
+use syncnet::trust::{MAX_CLOCK_SKEW_SECS, SignedVersionEnvelope};
 pub use syncnet::wire::bundle_v2::ProtectedBundleV2;
 use uuid::Uuid;
 
@@ -130,10 +131,6 @@ fn store_control_record_inner(
                 .map_err(|e| format!("Neispravno clanstvo: {e}"))?;
             crate::acl::check_delegation_at(conn, network_pub, m.admitter.as_ref(), m.issued_at)?;
             let revoked = crate::acl::revoked(conn, "membership", &m.device_key, &m.device_id)?;
-            let role_str = match m.role {
-                MemberRole::OwnDevice => "own_device",
-                MemberRole::FamilyMember => "family_member",
-            };
             let raw = serde_json::to_string(ctrl).map_err(|e| format!("JSON greska: {e}"))?;
             if !crate::acl::may_store(
                 conn,
@@ -141,7 +138,7 @@ fn store_control_record_inner(
                     id: &format!("membership:{}", m.device_key),
                     kind: "membership",
                     subject: &m.device_key,
-                    target: &m.principal_id,
+                    target: &m.device_key,
                     issued: m.issued_at,
                     raw: &raw,
                 },
@@ -151,12 +148,11 @@ fn store_control_record_inner(
             conn.execute(
                 "INSERT OR REPLACE INTO sync_trust_records
                  (record_id, kind, subject_key, target_id, permission, issued_at, expires_at, revoked, raw_json)
-                 VALUES (?1, 'membership', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, 'membership', ?2, ?3, '', ?4, ?5, ?6, ?7)",
                 params![
                     format!("membership:{}", m.device_key),
                     m.device_key,
-                    m.principal_id,
-                    role_str,
+                    m.device_key,
                     m.issued_at,
                     m.expires_at,
                     i32::from(revoked),
@@ -164,6 +160,51 @@ fn store_control_record_inner(
                 ],
             )
             .map_err(|e| format!("Greska upisa clanstva: {e}"))?;
+        }
+        ControlPayload::MemberRole(r) => {
+            if r.issued_at > now_unix {
+                return Err("Uloga članstva još nije važeća".into());
+            }
+            let member_vk = parse_public_key(&r.device_key)
+                .map_err(|e| format!("Neispravan kljuc clanstva: {e}"))?;
+            r.verify(network_pub, &member_vk, r.issued_at)
+                .map_err(|e| format!("Neispravna uloga clanstva: {e}"))?;
+            crate::acl::check_delegation_at(conn, network_pub, r.admitter.as_ref(), r.issued_at)?;
+            let revoked = crate::acl::revoked(conn, "membership", &r.device_key, &r.device_id)?;
+            let role_str = match r.role {
+                MemberRole::OwnDevice => "own_device",
+                MemberRole::FamilyMember => "family_member",
+            };
+            let raw = serde_json::to_string(ctrl).map_err(|e| format!("JSON greska: {e}"))?;
+            if !crate::acl::may_store(
+                conn,
+                crate::acl::ControlIdentity {
+                    id: &format!("member_role:{}", r.device_key),
+                    kind: "member_role",
+                    subject: &r.device_key,
+                    target: &r.principal_id,
+                    issued: r.issued_at,
+                    raw: &raw,
+                },
+            )? {
+                return Ok(());
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO sync_trust_records
+                 (record_id, kind, subject_key, target_id, permission, issued_at, expires_at, revoked, raw_json)
+                 VALUES (?1, 'member_role', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    format!("member_role:{}", r.device_key),
+                    r.device_key,
+                    r.principal_id,
+                    role_str,
+                    r.issued_at,
+                    r.expires_at,
+                    i32::from(revoked),
+                    raw
+                ],
+            )
+            .map_err(|e| format!("Greska upisa uloge clanstva: {e}"))?;
         }
         ControlPayload::ListGrant(g) => {
             if g.issued_at > now_unix {
@@ -223,6 +264,9 @@ fn store_control_record_inner(
                 return Err("Potpisnik opoziva nema ovlast na mrezi".to_owned());
             }
             let scope = r.scope().map_err(|e| e.to_string())?;
+            if !matches!(scope, "membership" | "ovlast" | "list_grant") {
+                return Err("Nepoznata vrsta opoziva".into());
+            }
             if r.public_key == network_b64 && scope != "list_grant" {
                 return Err(
                     "Korijenski ključ mreže nije članstvo ni delegirana ovlast uređaja".into(),
@@ -313,8 +357,30 @@ pub(crate) fn control_payload_is_relayable(
                     id: &format!("membership:{}", m.device_key),
                     kind: "membership",
                     subject: &m.device_key,
-                    target: &m.principal_id,
+                    target: &m.device_key,
                     issued: m.issued_at,
+                    raw: &raw,
+                },
+            )?;
+        }
+        ControlPayload::MemberRole(r) => {
+            if r.issued_at > now_unix {
+                return Err("Uloga članstva još nije važeća".into());
+            }
+            let member_vk = parse_public_key(&r.device_key)
+                .map_err(|e| format!("Neispravan kljuc clanstva: {e}"))?;
+            r.verify(network_pub, &member_vk, r.issued_at)
+                .map_err(|e| format!("Neispravna uloga clanstva: {e}"))?;
+            crate::acl::check_delegation_at(conn, network_pub, r.admitter.as_ref(), r.issued_at)?;
+            let raw = serde_json::to_string(ctrl).map_err(|e| format!("JSON greska: {e}"))?;
+            crate::acl::may_store(
+                conn,
+                crate::acl::ControlIdentity {
+                    id: &format!("member_role:{}", r.device_key),
+                    kind: "member_role",
+                    subject: &r.device_key,
+                    target: &r.principal_id,
+                    issued: r.issued_at,
                     raw: &raw,
                 },
             )?;
@@ -352,6 +418,9 @@ pub(crate) fn control_payload_is_relayable(
                 return Err("Potpisnik opoziva nema ovlast na mrezi".to_owned());
             }
             let scope = r.scope().map_err(|e| e.to_string())?;
+            if !matches!(scope, "membership" | "ovlast" | "list_grant") {
+                return Err("Nepoznata vrsta opoziva".into());
+            }
             if r.public_key == network_b64 && scope != "list_grant" {
                 return Err(
                     "Korijenski ključ mreže nije članstvo ni delegirana ovlast uređaja".into(),
@@ -603,7 +672,7 @@ fn verify_control_version_envelope(
         signature: v.signature.clone(),
     };
     let signer = env
-        .verify_signature()
+        .verify_signature(PROTOCOL_NAME)
         .map_err(|e| format!("Neispravan potpis kontrolnog zapisa: {e}"))?;
     let signer_b64 = public_key_to_base64(signer.as_bytes());
     let net_b64 = public_key_to_base64(network_pub.as_bytes());
@@ -658,7 +727,7 @@ pub(crate) fn verify_domain_version_auth(
         signature: v.signature.clone(),
     };
     let author_vk = env
-        .verify_signature()
+        .verify_signature(PROTOCOL_NAME)
         .map_err(|e| format!("Neispravan potpis autora verzije: {e}"))?;
     let author_b64 = public_key_to_base64(author_vk.as_bytes());
     let network_b64 = public_key_to_base64(network_pub.as_bytes());
@@ -683,19 +752,19 @@ pub(crate) fn verify_domain_version_auth(
         return Ok(());
     }
 
-    let Some(membership) =
+    let Some(_membership) =
         crate::acl::historical_membership(conn, network_pub, &author_b64, v.created_at_unix)?
     else {
         return Err("Autor nema valjano članstvo u trenutku nastanka verzije".into());
     };
-    let role_str = match membership.role {
-        MemberRole::OwnDevice => "own_device",
-        MemberRole::FamilyMember => "family_member",
-    };
-    let principal_id = membership.principal_id;
 
     if let Some(target_principal) = v.channel.strip_prefix("private:") {
-        if role_str != "own_device" || principal_id != target_principal {
+        let Some(role_rec) =
+            crate::acl::historical_member_role(conn, network_pub, &author_b64, v.created_at_unix)?
+        else {
+            return Err("Autor nema valjanu ulogu članstva u trenutku nastanka verzije".into());
+        };
+        if role_rec.role != MemberRole::OwnDevice || role_rec.principal_id != target_principal {
             return Err(
                 "Privatni kanal dopusten je iskljucivo provjerenom vlastitom uredjaju istog principala"
                     .to_owned(),
@@ -1926,37 +1995,42 @@ pub fn allowed_channels_for_recipient(
 
     let is_owner_root = recipient_pub_b64 == net_b64;
     let cached_membership_blocked:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sync_trust_records WHERE kind='membership' AND subject_key=?1 AND revoked!=0)",[recipient_pub_b64],|r|r.get(0)).map_err(|e|e.to_string())?;
-    let membership: Option<(String, String)> = if is_owner_root {
-        Some((
+    let membership: Option<Option<(String, String)>> = if is_owner_root {
+        Some(Some((
             "own_device".to_owned(),
             syncnet::identity::principal_id_from_key(network_pub.as_bytes()),
-        ))
-    } else {
-        if cached_membership_blocked {
-            None
-        } else {
-            crate::acl::historical_membership(conn, network_pub, recipient_pub_b64, now_unix)?.map(
-                |m| {
+        )))
+    } else if cached_membership_blocked {
+        None
+    } else if crate::acl::historical_membership(conn, network_pub, recipient_pub_b64, now_unix)?
+        .is_some()
+    {
+        let role_info =
+            crate::acl::historical_member_role(conn, network_pub, recipient_pub_b64, now_unix)?
+                .map(|r| {
                     (
-                        match m.role {
+                        match r.role {
                             MemberRole::OwnDevice => "own_device",
                             MemberRole::FamilyMember => "family_member",
                         }
                         .to_owned(),
-                        m.principal_id,
+                        r.principal_id,
                     )
-                },
-            )
-        }
+                });
+        Some(role_info)
+    } else {
+        None
     };
 
-    let Some((role, principal_id)) = membership else {
+    let Some(role_info) = membership else {
         return Ok(channels);
     };
 
     channels.insert("control".to_owned());
 
-    if role == "own_device" {
+    if let Some((role, principal_id)) = role_info
+        && role == "own_device"
+    {
         channels.insert(format!("private:{principal_id}"));
     }
     if is_owner_root {

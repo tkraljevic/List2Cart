@@ -17,10 +17,6 @@ use syncnet::{
         AuthenticatedStream, CredentialsProvider, TlsAuthError, accept_exchange_on,
         dial_exchange_on,
     },
-    tokio::{
-        io::{AsyncRead, AsyncWrite},
-        time::timeout,
-    },
     wire::{
         bundle_v2::ProtectedBundleV2,
         conversation::{
@@ -30,6 +26,10 @@ use syncnet::{
             exchange_step_by_role, receive_envelope_up_to, send_envelope,
         },
     },
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    time::timeout,
 };
 
 pub const DEFAULT_MAX_PAGE_BYTES: usize = 256 * 1024;
@@ -657,12 +657,12 @@ mod tests {
     use crate::{ledger::PeerRole, models::Unit, pairing_session::WelcomePack};
     use syncnet::{
         pairing::PairHello,
-        tokio::{self, io::AsyncWriteExt},
         wire::{
             conversation::{MAX_HELLO_FRAME_BYTES, expect_envelope},
             frame::write_frame_async,
         },
     };
+    use tokio::{self, io::AsyncWriteExt};
 
     type PairedTestPair = (
         Arc<Mutex<Database>>,

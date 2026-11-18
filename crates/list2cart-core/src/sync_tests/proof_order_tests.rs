@@ -127,9 +127,10 @@ fn revocation_in_same_packet_precedes_historical_domain_in_any_input_order() {
 
 #[test]
 fn snapshot_and_family_recovery_succeed_after_author_and_admin_revocations_and_settle_idle() {
+    use crate::acl_types::ListGrant;
     use base64::{Engine, engine::general_purpose::STANDARD};
     use ed25519_dalek::Signer;
-    use syncnet::trust::{ListGrant, Membership};
+    use syncnet::trust::Membership;
 
     let source = Database::open_in_memory().unwrap();
     let own_dest = Database::open_in_memory().unwrap();
@@ -150,8 +151,6 @@ fn snapshot_and_family_recovery_succeed_after_author_and_admin_revocations_and_s
             .admit_member(
                 "own-peer",
                 &own_peer_key.verifying_key(),
-                MemberRole::OwnDevice,
-                &root_principal,
                 "root",
                 Validity {
                     issued_at: f.now - 100,
@@ -160,14 +159,27 @@ fn snapshot_and_family_recovery_succeed_after_author_and_admin_revocations_and_s
             )
             .unwrap(),
     );
+    let own_role = ControlPayload::MemberRole(
+        issue_member_role(
+            &f.network,
+            "own-peer",
+            &own_peer_key.verifying_key(),
+            MemberRole::OwnDevice,
+            &root_principal,
+            "root",
+            Validity {
+                issued_at: f.now - 100,
+                valid_for_secs: 3600,
+            },
+        )
+        .unwrap(),
+    );
     let own_list_grant = grant(&f, &own_peer_key, "own-a", "list-a", ListPermission::Read);
     let root_own_membership = ControlPayload::Membership(
         f.network
             .admit_member(
                 "root-own",
                 &f.root.verifying_key(),
-                MemberRole::OwnDevice,
-                &root_principal,
                 "root",
                 Validity {
                     issued_at: f.now - 100,
@@ -175,6 +187,21 @@ fn snapshot_and_family_recovery_succeed_after_author_and_admin_revocations_and_s
                 },
             )
             .unwrap(),
+    );
+    let root_own_role = ControlPayload::MemberRole(
+        issue_member_role(
+            &f.network,
+            "root-own",
+            &f.root.verifying_key(),
+            MemberRole::OwnDevice,
+            &root_principal,
+            "root",
+            Validity {
+                issued_at: f.now - 100,
+                valid_for_secs: 3600,
+            },
+        )
+        .unwrap(),
     );
     let reader_member = member(&f, &reader, f.now - 100);
     let reader_grant = grant(&f, &reader, "reader-a", "list-a", ListPermission::Read);
@@ -204,8 +231,6 @@ fn snapshot_and_family_recovery_succeed_after_author_and_admin_revocations_and_s
             admin1_ovlast.clone(),
             "w2",
             &delegated_writer.verifying_key(),
-            MemberRole::FamilyMember,
-            "family-principal",
             Validity {
                 issued_at: f.now - 90,
                 valid_for_secs: 1000,
@@ -258,8 +283,6 @@ fn snapshot_and_family_recovery_succeed_after_author_and_admin_revocations_and_s
             admin2_old.clone(),
             "w3",
             &valid_writer.verifying_key(),
-            MemberRole::FamilyMember,
-            "family-principal",
             Validity {
                 issued_at: f.now - 80,
                 valid_for_secs: 1000,
@@ -328,8 +351,10 @@ fn snapshot_and_family_recovery_succeed_after_author_and_admin_revocations_and_s
     // Admit initial controls and writes on source BEFORE revocations and shortened ovlast arrive.
     let initial_controls = [
         control_version(&f, 1, "own-m", &own_membership, &f.root),
+        control_version(&f, 18, "own-r", &own_role, &f.root),
         control_version(&f, 2, "own-g", &own_list_grant, &f.root),
         control_version(&f, 3, "root-m", &root_own_membership, &f.root),
+        control_version(&f, 19, "root-r", &root_own_role, &f.root),
         control_version(&f, 4, "reader-m", &reader_member, &f.root),
         control_version(&f, 5, "reader-g", &reader_grant, &f.root),
         control_version(&f, 6, "w1-m", &w1_member, &f.root),
@@ -421,7 +446,7 @@ fn snapshot_and_family_recovery_succeed_after_author_and_admin_revocations_and_s
         v.supersedes = supersedes.into();
         let mut env: SignedVersionEnvelope =
             serde_json::from_value(serde_json::to_value(v).unwrap()).unwrap();
-        env = env.sign(&f.root);
+        env = env.sign(PROTOCOL_NAME, &f.root);
         serde_json::from_value(serde_json::to_value(env).unwrap()).unwrap()
     };
 
@@ -536,7 +561,13 @@ fn snapshot_and_family_recovery_succeed_after_author_and_admin_revocations_and_s
     );
 
     // Bootstrap destination nodes with their own membership and reader grant.
-    for ctrl in [&own_membership, &own_list_grant, &root_own_membership] {
+    for ctrl in [
+        &own_membership,
+        &own_role,
+        &own_list_grant,
+        &root_own_membership,
+        &root_own_role,
+    ] {
         store_control_record(own_dest.test_connection(), &f.network.public, ctrl, f.now).unwrap();
     }
     for ctrl in [&reader_member, &reader_grant] {

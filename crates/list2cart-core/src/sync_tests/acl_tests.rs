@@ -1,8 +1,9 @@
 use super::*;
+use crate::acl_types::{ListGrant, MemberRoleRecord};
 use crate::apply::allowed_channels_for_recipient;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::Signer;
-use syncnet::trust::{ListGrant, Membership, Revocation};
+use syncnet::trust::{Membership, Revocation};
 
 pub(super) fn member(f: &Fixture, key: &SigningKey, issued: i64) -> ControlPayload {
     ControlPayload::Membership(
@@ -10,8 +11,6 @@ pub(super) fn member(f: &Fixture, key: &SigningKey, issued: i64) -> ControlPaylo
             .admit_member(
                 "family",
                 &key.verifying_key(),
-                MemberRole::FamilyMember,
-                "family-principal",
                 "root",
                 Validity {
                     issued_at: issued,
@@ -19,6 +18,23 @@ pub(super) fn member(f: &Fixture, key: &SigningKey, issued: i64) -> ControlPaylo
                 },
             )
             .unwrap(),
+    )
+}
+pub(super) fn member_role(f: &Fixture, key: &SigningKey, issued: i64) -> ControlPayload {
+    ControlPayload::MemberRole(
+        issue_member_role(
+            &f.network,
+            "family",
+            &key.verifying_key(),
+            MemberRole::FamilyMember,
+            "family-principal",
+            "root",
+            Validity {
+                issued_at: issued,
+                valid_for_secs: 3600,
+            },
+        )
+        .unwrap(),
     )
 }
 pub(super) fn grant(
@@ -29,19 +45,19 @@ pub(super) fn grant(
     permission: ListPermission,
 ) -> ControlPayload {
     ControlPayload::ListGrant(
-        f.network
-            .issue_list_grant(
-                id,
-                list,
-                &key.verifying_key(),
-                permission,
-                "root",
-                Validity {
-                    issued_at: f.now - 10,
-                    valid_for_secs: 3600,
-                },
-            )
-            .unwrap(),
+        issue_list_grant(
+            &f.network,
+            id,
+            list,
+            &key.verifying_key(),
+            permission,
+            "root",
+            Validity {
+                issued_at: f.now - 10,
+                valid_for_secs: 3600,
+            },
+        )
+        .unwrap(),
     )
 }
 pub(super) fn revocation(
@@ -70,7 +86,7 @@ pub(super) fn with_grant(v: Version, key: &SigningKey, grant: &str) -> Version {
         serde_json::from_value(serde_json::to_value(v).unwrap()).unwrap();
     env.grant_ref = grant.into();
     env.node_id = verifying_key_to_base64(&key.verifying_key());
-    serde_json::from_value(serde_json::to_value(env.sign(key)).unwrap()).unwrap()
+    serde_json::from_value(serde_json::to_value(env.sign(PROTOCOL_NAME, key)).unwrap()).unwrap()
 }
 
 fn earlier(f: &Fixture, seconds: i64) -> Fixture {
@@ -111,20 +127,20 @@ fn historical_membership_uses_latest_issuance_without_privilege_fallback() {
     let key = SigningKey::from_bytes(&[94; 32]);
     let public = verifying_key_to_base64(&key.verifying_key());
     let make_member = |role, issued, lifetime| {
-        ControlPayload::Membership(
-            f.network
-                .admit_member(
-                    "family",
-                    &key.verifying_key(),
-                    role,
-                    "family-principal",
-                    "root",
-                    Validity {
-                        issued_at: issued,
-                        valid_for_secs: lifetime,
-                    },
-                )
-                .unwrap(),
+        ControlPayload::MemberRole(
+            issue_member_role(
+                &f.network,
+                "family",
+                &key.verifying_key(),
+                role,
+                "family-principal",
+                "root",
+                Validity {
+                    issued_at: issued,
+                    valid_for_secs: lifetime,
+                },
+            )
+            .unwrap(),
         )
     };
     let owner = make_member(MemberRole::OwnDevice, old.now - 10, 1000);
@@ -134,26 +150,26 @@ fn historical_membership_uses_latest_issuance_without_privilege_fallback() {
         assert!(
             f.apply(
                 conn,
-                &[control_version(clock, seq, "member", payload, &f.root)]
+                &[control_version(clock, seq, "member_role", payload, &f.root)]
             )
             .unwrap()
             .rejected
             .is_empty()
         );
     }
-    let historic = crate::acl::historical_membership(conn, &f.network.public, &public, old.now)
+    let historic = crate::acl::historical_member_role(conn, &f.network.public, &public, old.now)
         .unwrap()
         .unwrap();
     assert_eq!(historic.role, MemberRole::OwnDevice);
     assert_eq!(
-        crate::acl::historical_membership(conn, &f.network.public, &public, old.now + 15)
+        crate::acl::historical_member_role(conn, &f.network.public, &public, old.now + 15)
             .unwrap()
             .unwrap()
             .role,
         MemberRole::FamilyMember
     );
     assert!(
-        crate::acl::historical_membership(conn, &f.network.public, &public, old.now + 40)
+        crate::acl::historical_member_role(conn, &f.network.public, &public, old.now + 40)
             .unwrap()
             .is_none(),
         "expired newer certificate must not revive old owner rights"
@@ -173,7 +189,7 @@ fn historical_membership_uses_latest_issuance_without_privilege_fallback() {
     )
     .unwrap();
     assert_eq!(
-        crate::acl::historical_membership(conn, &f.network.public, &public, old.now)
+        crate::acl::historical_member_role(conn, &f.network.public, &public, old.now)
             .unwrap()
             .unwrap()
             .role,
@@ -193,8 +209,6 @@ fn expired_history_validates_old_writes_without_restoring_current_access() {
             .admit_member(
                 "family",
                 &key.verifying_key(),
-                MemberRole::FamilyMember,
-                "family-principal",
                 "root",
                 Validity {
                     issued_at: old.now - 10,
@@ -202,22 +216,38 @@ fn expired_history_validates_old_writes_without_restoring_current_access() {
                 },
             )
             .unwrap(),
+    );
+    let role_rec = ControlPayload::MemberRole(
+        issue_member_role(
+            &old.network,
+            "family",
+            &key.verifying_key(),
+            MemberRole::FamilyMember,
+            "family-principal",
+            "root",
+            Validity {
+                issued_at: old.now - 10,
+                valid_for_secs: 30,
+            },
+        )
+        .unwrap(),
     );
     let permission = ControlPayload::ListGrant(
-        old.network
-            .issue_list_grant(
-                "grant-a",
-                "list-a",
-                &key.verifying_key(),
-                ListPermission::Write,
-                "root",
-                Validity {
-                    issued_at: old.now - 10,
-                    valid_for_secs: 30,
-                },
-            )
-            .unwrap(),
+        issue_list_grant(
+            &old.network,
+            "grant-a",
+            "list-a",
+            &key.verifying_key(),
+            ListPermission::Write,
+            "root",
+            Validity {
+                issued_at: old.now - 10,
+                valid_for_secs: 30,
+            },
+        )
+        .unwrap(),
     );
+    store_control_record(conn, &f.network.public, &role_rec, f.now).unwrap();
     let renewal = member(&f, &key, f.now - 10);
     // Newer effective membership is deliberately admitted before the old proof.
     f.apply(conn, &[control_version(&f, 1, "member", &renewal, &f.root)])
@@ -285,8 +315,6 @@ fn expired_delegation_proves_historical_control_but_not_new_issuance() {
             authority.clone(),
             "family",
             &key.verifying_key(),
-            MemberRole::FamilyMember,
-            "family-principal",
             Validity {
                 issued_at: old.now,
                 valid_for_secs: 20,
@@ -371,7 +399,8 @@ fn stable_control_ids_cannot_rebind_or_replay_old_memberships() {
     let key = SigningKey::from_bytes(&[82; 32]);
     let old = member(&f, &key, f.now - 20);
     let new = member(&f, &key, f.now - 10);
-    for ctrl in [&old, &new, &old] {
+    let role_rec = member_role(&f, &key, f.now - 10);
+    for ctrl in [&old, &new, &old, &role_rec] {
         store_control_record(conn, &f.network.public, ctrl, f.now).unwrap();
     }
     let issued: i64 = conn
@@ -382,20 +411,20 @@ fn stable_control_ids_cannot_rebind_or_replay_old_memberships() {
         )
         .unwrap();
     assert_eq!(issued, f.now - 10);
-    let rebound = ControlPayload::Membership(
-        f.network
-            .admit_member(
-                "family",
-                &key.verifying_key(),
-                MemberRole::OwnDevice,
-                "other-principal",
-                "root",
-                Validity {
-                    issued_at: f.now,
-                    valid_for_secs: 3600,
-                },
-            )
-            .unwrap(),
+    let rebound = ControlPayload::MemberRole(
+        issue_member_role(
+            &f.network,
+            "family",
+            &key.verifying_key(),
+            MemberRole::OwnDevice,
+            "other-principal",
+            "root",
+            Validity {
+                issued_at: f.now,
+                valid_for_secs: 3600,
+            },
+        )
+        .unwrap(),
     );
     assert!(store_control_record(conn, &f.network.public, &rebound, f.now).is_err());
     let first = grant(&f, &key, "stable-grant", "list-a", ListPermission::Read);
@@ -652,8 +681,6 @@ fn superseded_admin_authority_cannot_issue_new_certificates_via_old_embedded_pro
         old.clone(),
         "reader",
         &reader.verifying_key(),
-        MemberRole::FamilyMember,
-        "family-principal",
         Validity {
             issued_at: f.now - 5,
             valid_for_secs: 100,
@@ -674,8 +701,6 @@ fn superseded_admin_authority_cannot_issue_new_certificates_via_old_embedded_pro
         old,
         "reader",
         &reader.verifying_key(),
-        MemberRole::FamilyMember,
-        "family-principal",
         Validity {
             issued_at: f.now - 50,
             valid_for_secs: 100,
@@ -771,8 +796,6 @@ fn revoking_admin_device_key_closes_delegated_read_access_even_with_stale_flags(
         authority,
         "own",
         &SigningKey::from_bytes(&[126; 32]).verifying_key(),
-        MemberRole::OwnDevice,
-        "family-principal",
         Validity {
             issued_at: f.now - 30,
             valid_for_secs: 100,
@@ -826,6 +849,17 @@ fn revoking_delegation_blocks_embedded_old_authority_and_its_issued_grants() {
         authority.clone(),
         "family",
         &family.verifying_key(),
+        Validity {
+            issued_at: f.now - 50,
+            valid_for_secs: 300,
+        },
+    )
+    .unwrap();
+    let delegated_role = MemberRoleRecord::admit_as(
+        &admin,
+        authority.clone(),
+        "family",
+        &family.verifying_key(),
         MemberRole::FamilyMember,
         "family-principal",
         Validity {
@@ -838,6 +872,13 @@ fn revoking_delegation_blocks_embedded_old_authority_and_its_issued_grants() {
         conn,
         &f.network.public,
         &ControlPayload::Membership(delegated),
+        f.now,
+    )
+    .unwrap();
+    store_control_record(
+        conn,
+        &f.network.public,
+        &ControlPayload::MemberRole(delegated_role),
         f.now,
     )
     .unwrap();
@@ -903,8 +944,6 @@ fn revoking_delegation_blocks_embedded_old_authority_and_its_issued_grants() {
         authority.clone(),
         "new-family",
         &SigningKey::from_bytes(&[87; 32]).verifying_key(),
-        MemberRole::FamilyMember,
-        "new-principal",
         Validity {
             issued_at: f.now - 1,
             valid_for_secs: 100,

@@ -296,6 +296,7 @@ pub struct PlannedItemSyncPayload {
 pub enum ControlPayload {
     Ovlast(syncnet::trust::Ovlast),
     Membership(syncnet::trust::Membership),
-    ListGrant(syncnet::trust::ListGrant),
+    MemberRole(crate::acl_types::MemberRoleRecord),
+    ListGrant(crate::acl_types::ListGrant),
     Revocation(syncnet::trust::Revocation),
 }

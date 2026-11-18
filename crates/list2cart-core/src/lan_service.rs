@@ -14,12 +14,6 @@ pub use syncnet::transport::discovery::{FoundPeer, clear_pairing_flag, write_pai
 use syncnet::{
     identity::{parse_public_key, public_key_to_base64},
     tls::{CredentialsProvider, TlsAuthError, accept_exchange_on},
-    tokio::{
-        self,
-        net::{TcpListener, TcpStream, UdpSocket},
-        sync::Mutex as AsyncMutex,
-        task::JoinHandle,
-    },
     transport::{
         discovery::{
             Beacon, DEFAULT_DISCOVERY_PORT, announce_on, discover_lan, discover_on,
@@ -32,6 +26,12 @@ use syncnet::{
         },
     },
     wire::conversation::{ConversationEnvelope, ConversationError, RefusalCode, send_envelope},
+};
+use tokio::{
+    self,
+    net::{TcpListener, TcpStream, UdpSocket},
+    sync::Mutex as AsyncMutex,
+    task::JoinHandle,
 };
 
 /// Discovers List2Cart peers on the local LAN using the default discovery port and protocol.

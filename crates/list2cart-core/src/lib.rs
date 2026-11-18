@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod acl;
+pub mod acl_types;
 pub mod apply;
 pub mod backfill;
 pub mod calc;

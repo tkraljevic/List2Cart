@@ -494,7 +494,7 @@ fn record_version_with_key(
             payload: payload.to_owned(),
             signature: String::new(),
         }
-        .sign(sk);
+        .sign(crate::apply::PROTOCOL_NAME, sk);
         (env.author_pub_key, env.signature)
     } else {
         (String::new(), String::new())

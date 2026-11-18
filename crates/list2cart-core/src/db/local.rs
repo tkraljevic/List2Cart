@@ -1,5 +1,6 @@
 //! Local changes and their signed snapshots share one SQLite transaction.
 use super::*;
+use crate::acl_types::{MemberRole, issue_member_role};
 use crate::apply::{
     store_control_record, validate_payload_syntax_only, verify_domain_version_auth,
 };
@@ -10,7 +11,7 @@ use syncnet::identity::{
     generate_signing_key, load_key, load_or_create_key, parse_public_key, principal_id_from_key,
     verifying_key_to_base64,
 };
-use syncnet::trust::{MemberRole, NetworkKey, Validity};
+use syncnet::trust::{NetworkKey, Validity};
 
 const ID_NAMESPACE: Uuid = Uuid::from_u128(0x6c32632d_6c6f_4361_8c69_64656e746974);
 const ENTITIES: [&str; 7] = [
@@ -646,13 +647,26 @@ impl Database {
                 now,
             )
             .map_err(|e| e.to_string())?;
-            if m.principal_id != self.identity.principal {
-                return Err("Clanstvo je vezano uz drugu osobu".into());
-            }
-        } else if let Some(root) = &self.identity.network_key {
-            let network = NetworkKey::from_signing_key("List2Cart", root.clone());
-            let m = network
-                .admit_member(
+            let existing_role: Option<String> = tx.query_row("SELECT raw_json FROM sync_trust_records WHERE kind='member_role' AND subject_key=?1", [&public.device_public_key], |r| r.get(0)).optional().map_err(sql_error)?;
+            if let Some(role_json) = existing_role {
+                let ControlPayload::MemberRole(r) = serde_json::from_str(&role_json)
+                    .map_err(|e| format!("Neispravna lokalna uloga clanstva: {e}"))?
+                else {
+                    return Err("Neispravan tip uloge clanstva".into());
+                };
+                r.verify(
+                    &self.identity.network_public,
+                    &self.identity.key.verifying_key(),
+                    now,
+                )
+                .map_err(|e| e.to_string())?;
+                if r.principal_id != self.identity.principal {
+                    return Err("Clanstvo je vezano uz drugu osobu".into());
+                }
+            } else if let Some(root) = &self.identity.network_key {
+                let network = NetworkKey::from_signing_key("List2Cart", root.clone());
+                let role_rec = issue_member_role(
+                    &network,
                     &public.device_public_key,
                     &self.identity.key.verifying_key(),
                     MemberRole::OwnDevice,
@@ -662,6 +676,37 @@ impl Database {
                         issued_at: now,
                         valid_for_secs: 10 * 365 * 86400,
                     },
+                )
+                .map_err(|e| e.to_string())?;
+                let role_ctrl = ControlPayload::MemberRole(role_rec);
+                store_control_record(&tx, &network.public, &role_ctrl, now)?;
+                let role_payload = serde_json::to_string(&role_ctrl).map_err(|e| e.to_string())?;
+                record_signed_version(
+                    &tx,
+                    &public.network_public_key,
+                    root,
+                    "member_role",
+                    &format!("member_role:{}", public.device_public_key),
+                    false,
+                    &role_payload,
+                    "control",
+                    "",
+                )?;
+            } else {
+                return Err("Nedostaje uloga clanstva uredjaja".into());
+            }
+        } else if let Some(root) = &self.identity.network_key {
+            let network = NetworkKey::from_signing_key("List2Cart", root.clone());
+            let validity = Validity {
+                issued_at: now,
+                valid_for_secs: 10 * 365 * 86400,
+            };
+            let m = network
+                .admit_member(
+                    &public.device_public_key,
+                    &self.identity.key.verifying_key(),
+                    "root",
+                    validity,
                 )
                 .map_err(|e| e.to_string())?;
             let ctrl = ControlPayload::Membership(m);
@@ -675,6 +720,30 @@ impl Database {
                 &format!("membership:{}", public.device_public_key),
                 false,
                 &payload,
+                "control",
+                "",
+            )?;
+            let role_rec = issue_member_role(
+                &network,
+                &public.device_public_key,
+                &self.identity.key.verifying_key(),
+                MemberRole::OwnDevice,
+                &public.principal_id,
+                "root",
+                validity,
+            )
+            .map_err(|e| e.to_string())?;
+            let role_ctrl = ControlPayload::MemberRole(role_rec);
+            store_control_record(&tx, &network.public, &role_ctrl, now)?;
+            let role_payload = serde_json::to_string(&role_ctrl).map_err(|e| e.to_string())?;
+            record_signed_version(
+                &tx,
+                &public.network_public_key,
+                root,
+                "member_role",
+                &format!("member_role:{}", public.device_public_key),
+                false,
+                &role_payload,
                 "control",
                 "",
             )?;

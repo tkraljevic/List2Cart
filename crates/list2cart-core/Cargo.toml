@@ -11,7 +11,7 @@ csv = "1"
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 encoding_rs = "0.8"
 hex = "0.4"
-syncnet = { version = "0.0.1", git = "https://github.com/tkraljevic/syncnet", rev = "cf820b0ad3b5159b68c5731cc1ba91ceec7f5c12" }
+syncnet = { version = "0.0.1", git = "https://github.com/tkraljevic/syncnet", rev = "0c5359eccb67fdeb4d35ff01ea297a70a46e30ab" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.43", features = ["bundled"] }
 rust_xlsxwriter = "0.102"

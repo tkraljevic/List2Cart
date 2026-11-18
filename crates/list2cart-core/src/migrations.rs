@@ -83,7 +83,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
     }
     if current_ver < 6 {
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-        tx.execute_batch("UPDATE sync_trust_records SET permission=CASE WHEN json_valid(raw_json) THEN CASE json_extract(raw_json,'$.data.kind') WHEN 'list_grant' THEN 'list_grant' WHEN 'ovlast' THEN 'ovlast' WHEN 'membership' THEN 'membership' WHEN 'clanstvo' THEN 'membership' ELSE 'legacy_key' END ELSE 'legacy_key' END WHERE kind='revocation';").map_err(|e|e.to_string())?;
+        tx.execute_batch("UPDATE sync_trust_records SET permission=CASE WHEN json_valid(raw_json) THEN CASE COALESCE(json_extract(raw_json,'$.data.vrsta'),json_extract(raw_json,'$.data.kind')) WHEN 'list_grant' THEN 'list_grant' WHEN 'ovlast' THEN 'ovlast' WHEN 'membership' THEN 'membership' WHEN 'clanstvo' THEN 'membership' ELSE 'legacy_key' END ELSE 'legacy_key' END WHERE kind='revocation';").map_err(|e|e.to_string())?;
         tx.execute_batch("UPDATE sync_trust_records AS r SET permission='legacy_key' WHERE r.kind='revocation' AND r.permission='list_grant' AND EXISTS(SELECT 1 FROM sync_trust_records t WHERE t.record_id=r.target_id AND (t.kind!='list_grant' OR t.subject_key!=r.subject_key));").map_err(|e|e.to_string())?;
         crate::acl::apply_revocation_flags(&tx, true)?;
         tx.execute(

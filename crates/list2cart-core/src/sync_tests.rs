@@ -1,4 +1,5 @@
-use crate::apply::{ApplyContext, apply_remote_versions, store_control_record};
+use crate::acl_types::{ListPermission, MemberRole, issue_list_grant, issue_member_role};
+use crate::apply::{ApplyContext, PROTOCOL_NAME, apply_remote_versions, store_control_record};
 use crate::db::Database;
 use crate::ledger::Version;
 use crate::models::{ControlPayload, PlannedItemSyncPayload, ShoppingListSyncPayload, Unit};
@@ -7,7 +8,7 @@ use ed25519_dalek::SigningKey;
 use rusqlite::{Connection, params};
 use std::collections::BTreeMap;
 use syncnet::identity::verifying_key_to_base64;
-use syncnet::trust::{ListPermission, MemberRole, NetworkKey, SignedVersionEnvelope, Validity};
+use syncnet::trust::{NetworkKey, SignedVersionEnvelope, Validity};
 use uuid::Uuid;
 
 mod acl_tests;
@@ -71,7 +72,7 @@ impl Fixture {
             payload,
             signature: String::new(),
         }
-        .sign(key);
+        .sign(PROTOCOL_NAME, key);
         Version {
             version_id: env.version_id,
             entity: env.entity,
@@ -174,8 +175,6 @@ fn revoking_one_list_grant_keeps_other_lists_and_membership_active() {
         .admit_member(
             "family",
             &family.verifying_key(),
-            MemberRole::FamilyMember,
-            "family-principal",
             "root",
             Validity {
                 issued_at: f.now - 10,
@@ -183,6 +182,19 @@ fn revoking_one_list_grant_keeps_other_lists_and_membership_active() {
             },
         )
         .unwrap();
+    let role_rec = issue_member_role(
+        &f.network,
+        "family",
+        &family.verifying_key(),
+        MemberRole::FamilyMember,
+        "family-principal",
+        "root",
+        Validity {
+            issued_at: f.now - 10,
+            valid_for_secs: 3600,
+        },
+    )
+    .unwrap();
     store_control_record(
         conn,
         &f.network.public,
@@ -190,20 +202,27 @@ fn revoking_one_list_grant_keeps_other_lists_and_membership_active() {
         f.now,
     )
     .unwrap();
+    store_control_record(
+        conn,
+        &f.network.public,
+        &ControlPayload::MemberRole(role_rec),
+        f.now,
+    )
+    .unwrap();
     let grant = |id: &str, list: &str| {
-        f.network
-            .issue_list_grant(
-                id,
-                list,
-                &family.verifying_key(),
-                ListPermission::Write,
-                "root",
-                Validity {
-                    issued_at: f.now - 10,
-                    valid_for_secs: 3600,
-                },
-            )
-            .unwrap()
+        issue_list_grant(
+            &f.network,
+            id,
+            list,
+            &family.verifying_key(),
+            ListPermission::Write,
+            "root",
+            Validity {
+                issued_at: f.now - 10,
+                valid_for_secs: 3600,
+            },
+        )
+        .unwrap()
     };
     let a = ControlPayload::ListGrant(grant("grant-revoked", "list-a"));
     let b = ControlPayload::ListGrant(grant("grant-a", "list-b"));
@@ -1080,8 +1099,6 @@ fn grant_cannot_write_another_list_or_private_entities() {
         .admit_member(
             "family",
             &family.verifying_key(),
-            MemberRole::FamilyMember,
-            "another-person",
             "root",
             Validity {
                 issued_at: f.now - 10,
@@ -1089,6 +1106,19 @@ fn grant_cannot_write_another_list_or_private_entities() {
             },
         )
         .unwrap();
+    let role_rec = issue_member_role(
+        &f.network,
+        "family",
+        &family.verifying_key(),
+        MemberRole::FamilyMember,
+        "another-person",
+        "root",
+        Validity {
+            issued_at: f.now - 10,
+            valid_for_secs: 3600,
+        },
+    )
+    .unwrap();
     store_control_record(
         conn,
         &f.network.public,
@@ -1096,20 +1126,26 @@ fn grant_cannot_write_another_list_or_private_entities() {
         f.now,
     )
     .unwrap();
-    let grant = f
-        .network
-        .issue_list_grant(
-            "grant-a",
-            "list-a",
-            &family.verifying_key(),
-            ListPermission::Write,
-            "root",
-            Validity {
-                issued_at: f.now - 10,
-                valid_for_secs: 3600,
-            },
-        )
-        .unwrap();
+    store_control_record(
+        conn,
+        &f.network.public,
+        &ControlPayload::MemberRole(role_rec),
+        f.now,
+    )
+    .unwrap();
+    let grant = issue_list_grant(
+        &f.network,
+        "grant-a",
+        "list-a",
+        &family.verifying_key(),
+        ListPermission::Write,
+        "root",
+        Validity {
+            issued_at: f.now - 10,
+            valid_for_secs: 3600,
+        },
+    )
+    .unwrap();
     store_control_record(
         conn,
         &f.network.public,
