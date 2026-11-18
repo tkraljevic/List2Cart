@@ -4003,7 +4003,7 @@ dependencies = [
 [[package]]
 name = "syncnet"
 version = "0.0.1"
-source = "git+https://github.com/tkraljevic/syncnet?rev=0c5359eccb67fdeb4d35ff01ea297a70a46e30ab#0c5359eccb67fdeb4d35ff01ea297a70a46e30ab"
+source = "git+https://github.com/tkraljevic/syncnet?rev=a2aaba1768e9f14c91cd2fc08b7e8d6a4b20526c#a2aaba1768e9f14c91cd2fc08b7e8d6a4b20526c"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
