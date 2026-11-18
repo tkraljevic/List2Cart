@@ -1,4 +1,5 @@
 mod local;
+pub(crate) use local::local_snapshot_for_pairing;
 pub use local::{IdentityConflict, LocalEntity, SyncIdentity};
 
 use crate::calc::calculate_line_total_cents;
@@ -77,6 +78,7 @@ impl Database {
         let db = Self { conn, identity };
         db.init_schema()?;
         db.initialize_local_identity()?;
+        crate::content::migrate_inline_product_images(&db.conn, db.blobs_dir().as_deref())?;
         Ok(db)
     }
 
@@ -89,6 +91,7 @@ impl Database {
         };
         db.init_schema()?;
         db.initialize_local_identity()?;
+        crate::content::migrate_inline_product_images(&db.conn, db.blobs_dir().as_deref())?;
         Ok(db)
     }
 
@@ -255,7 +258,9 @@ impl Database {
         if last.is_some_and(|last| now >= last && now - last < 86400) {
             return Ok(None);
         }
-        self.compact_ledger().map(Some)
+        let compacted = self.compact_ledger()?;
+        let _ = self.gc_unreferenced_content();
+        Ok(Some(compacted))
     }
 
     fn seed_default_stores(&self) -> Result<(), String> {
@@ -305,6 +310,19 @@ impl Database {
         self.local_upsert_product(input)
     }
 
+    fn hydrate_product_image(&self, prod: &mut Product, image_hash: &str) {
+        if prod.image_data_url.is_none()
+            && !image_hash.is_empty()
+            && let Ok(Some((mime, bytes))) = crate::content::load_verified_blob(
+                &self.conn,
+                self.blobs_dir().as_deref(),
+                image_hash,
+            )
+        {
+            prod.image_data_url = Some(crate::content::format_image_data_url(&mime, &bytes));
+        }
+    }
+
     pub fn get_product(&self, barcode: &str) -> Result<Option<Product>, String> {
         let matches: i64 = self
             .conn
@@ -320,27 +338,38 @@ impl Database {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT barcode, sync_id, name, category, default_unit, last_price_cents, last_store_name, image_data_url, updated_at
+                "SELECT barcode, sync_id, name, category, default_unit, last_price_cents, last_store_name, image_data_url, image_hash, updated_at
                  FROM products WHERE barcode = ?1 AND archived = 0",
             )
             .map_err(|e| format!("Greska upita artikla: {e}"))?;
 
-        stmt.query_row(params![barcode.trim()], |row| {
-            let unit_str: String = row.get(4)?;
-            Ok(Product {
-                barcode: row.get(0)?,
-                sync_id: row.get(1)?,
-                name: row.get(2)?,
-                category: row.get(3)?,
-                default_unit: Unit::parse(&unit_str).unwrap_or(Unit::Kom),
-                last_price_cents: row.get(5)?,
-                last_store_name: row.get(6)?,
-                image_data_url: row.get(7)?,
-                updated_at: row.get(8)?,
+        let row_opt = stmt
+            .query_row(params![barcode.trim()], |row| {
+                let unit_str: String = row.get(4)?;
+                let inline_url: Option<String> = row.get(7)?;
+                let image_hash: String = row.get(8)?;
+                Ok((
+                    Product {
+                        barcode: row.get(0)?,
+                        sync_id: row.get(1)?,
+                        name: row.get(2)?,
+                        category: row.get(3)?,
+                        default_unit: Unit::parse(&unit_str).unwrap_or(Unit::Kom),
+                        last_price_cents: row.get(5)?,
+                        last_store_name: row.get(6)?,
+                        image_data_url: inline_url,
+                        updated_at: row.get(9)?,
+                    },
+                    image_hash,
+                ))
             })
-        })
-        .optional()
-        .map_err(|e| format!("Greska citanja artikla: {e}"))
+            .optional()
+            .map_err(|e| format!("Greska citanja artikla: {e}"))?;
+
+        Ok(row_opt.map(|(mut prod, image_hash)| {
+            self.hydrate_product_image(&mut prod, &image_hash);
+            prod
+        }))
     }
 
     pub fn list_products(&self, search: Option<&str>) -> Result<Vec<Product>, String> {
@@ -351,7 +380,7 @@ impl Database {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT barcode, sync_id, name, category, default_unit, last_price_cents, last_store_name, image_data_url, updated_at
+                "SELECT barcode, sync_id, name, category, default_unit, last_price_cents, last_store_name, image_data_url, image_hash, updated_at
                  FROM products
                    WHERE archived = 0 AND (LOWER(name) LIKE ?1 OR LOWER(barcode) LIKE ?1 OR LOWER(category) LIKE ?1)
                  ORDER BY updated_at DESC",
@@ -361,23 +390,28 @@ impl Database {
         let rows = stmt
             .query_map(params![pattern], |row| {
                 let unit_str: String = row.get(4)?;
-                Ok(Product {
-                    barcode: row.get(0)?,
-                    sync_id: row.get(1)?,
-                    name: row.get(2)?,
-                    category: row.get(3)?,
-                    default_unit: Unit::parse(&unit_str).unwrap_or(Unit::Kom),
-                    last_price_cents: row.get(5)?,
-                    last_store_name: row.get(6)?,
-                    image_data_url: row.get(7)?,
-                    updated_at: row.get(8)?,
-                })
+                Ok((
+                    Product {
+                        barcode: row.get(0)?,
+                        sync_id: row.get(1)?,
+                        name: row.get(2)?,
+                        category: row.get(3)?,
+                        default_unit: Unit::parse(&unit_str).unwrap_or(Unit::Kom),
+                        last_price_cents: row.get(5)?,
+                        last_store_name: row.get(6)?,
+                        image_data_url: row.get(7)?,
+                        updated_at: row.get(9)?,
+                    },
+                    row.get::<_, String>(8)?,
+                ))
             })
             .map_err(|e| format!("Greska citanja kataloga: {e}"))?;
 
         let mut products = Vec::new();
         for row in rows {
-            products.push(row.map_err(|e| format!("Greska retka artikla: {e}"))?);
+            let (mut prod, image_hash) = row.map_err(|e| format!("Greska retka artikla: {e}"))?;
+            self.hydrate_product_image(&mut prod, &image_hash);
+            products.push(prod);
         }
         Ok(products)
     }
@@ -1240,7 +1274,7 @@ mod tests {
             default_unit: Unit::Kom,
             price_cents: 149,
             store_name: "Super Konzum",
-            image_data_url: Some("data:image/webp;base64,AAAA"),
+            image_data_url: Some("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="),
         })
         .expect("upsert 1");
 
@@ -1258,7 +1292,9 @@ mod tests {
         let prod = db.get_product("3850102123").expect("get").expect("exists");
         assert_eq!(
             prod.image_data_url.as_deref(),
-            Some("data:image/webp;base64,AAAA")
+            Some(
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+            )
         );
 
         let prices = db.get_product_store_prices("3850102123").expect("prices");

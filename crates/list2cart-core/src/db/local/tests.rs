@@ -105,7 +105,7 @@ fn interrupted_receipt_transfer_resumes_after_disk_reopen_without_partial_displa
         .conn
         .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
         .unwrap();
-    list2cart_sync::identity::save_key_exclusive(&key_path(&path, "device"), &replica.identity.key)
+    syncnet::identity::save_key_exclusive(&key_path(&path, "device"), &replica.identity.key)
         .unwrap();
     drop(replica);
     let reopened = Database::open(&path).unwrap();
@@ -435,6 +435,7 @@ fn join_for_test(source: &Database) -> Database {
             network_public: source.identity.network_public,
             network_key: None,
             principal: source.identity.principal.clone(),
+            db_path: None,
         },
     };
     db.init_schema().unwrap();
@@ -795,8 +796,7 @@ fn late_older_record_reaches_a_third_device_even_after_a_high_frontier_was_confi
         .conn
         .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
         .unwrap();
-    list2cart_sync::identity::save_key_exclusive(&key_path(&path, "device"), &relay.identity.key)
-        .unwrap();
+    syncnet::identity::save_key_exclusive(&key_path(&path, "device"), &relay.identity.key).unwrap();
     drop(relay);
     let relay = Database::open(&path).unwrap();
     let SyncReceiveOutcome::Snapshot { progress: first } =
@@ -1002,7 +1002,7 @@ fn automatic_exchange_rejects_forged_requests_and_unrelated_failures_do_not_star
         .unwrap();
     let mut legacy_reset: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
     legacy_reset["batch"]["snapshot_reset_keys"] = serde_json::json!(["not-a-paged-manifest"]);
-    let legacy_reset = list2cart_sync::wire::bundle_v2::ProtectedBundleV2::seal(
+    let legacy_reset = syncnet::wire::bundle_v2::ProtectedBundleV2::seal(
         crate::apply::PROTOCOL_NAME,
         &source.identity.key,
         destination.identity.key.verifying_key().as_bytes(),
@@ -1025,7 +1025,7 @@ fn automatic_exchange_rejects_forged_requests_and_unrelated_failures_do_not_star
 #[test]
 fn automatic_exchange_chooses_recovery_resumes_after_restart_and_returns_to_delta() {
     use crate::exchange::SyncReceiveOutcome;
-    use list2cart_sync::identity::save_key_exclusive;
+    use syncnet::identity::save_key_exclusive;
     let dir = TestDir::new();
     let source_path = dir.0.join("auto-source.sqlite");
     let destination_path = dir.0.join("auto-destination.sqlite");
@@ -1362,7 +1362,7 @@ fn snapshot_preserves_newer_local_edits_and_rechecks_own_device_permissions() {
     use sha2::{Digest, Sha256};
     malformed["snapshot_page"]["manifest"]["sha256"] = hex::encode(Sha256::digest(&data)).into();
     malformed["snapshot_page"]["manifest"]["total_bytes"] = data.len().into();
-    let invalid = list2cart_sync::wire::bundle_v2::ProtectedBundleV2::seal(
+    let invalid = syncnet::wire::bundle_v2::ProtectedBundleV2::seal(
         crate::apply::PROTOCOL_NAME,
         &source.identity.key,
         destination.identity.key.verifying_key().as_bytes(),
@@ -1462,7 +1462,7 @@ fn snapshot_preparation_rolls_back_and_transfer_quotas_are_recoverable() {
 
 #[test]
 fn snapshot_pages_resume_after_both_databases_reopen_and_commit_only_at_completion() {
-    use list2cart_sync::identity::save_key_exclusive;
+    use syncnet::identity::save_key_exclusive;
     let dir = TestDir::new();
     let source_path = dir.0.join("snapshot-source.sqlite");
     let destination_path = dir.0.join("snapshot-recipient.sqlite");
@@ -1571,7 +1571,7 @@ fn snapshot_pages_resume_after_both_databases_reopen_and_commit_only_at_completi
             // A validly encrypted but changed final page cannot complete the manifest.
             let mut changed = json.clone();
             changed["snapshot_page"]["versions"][0]["payload"] = "corrupt".into();
-            let corrupted = list2cart_sync::wire::bundle_v2::ProtectedBundleV2::seal(
+            let corrupted = syncnet::wire::bundle_v2::ProtectedBundleV2::seal(
                 crate::apply::PROTOCOL_NAME,
                 &source.identity.key,
                 destination.identity.key.verifying_key().as_bytes(),
@@ -1802,7 +1802,7 @@ fn actual_local_commands_produce_full_signed_snapshots_and_replicate() {
     .unwrap();
     let recorded = versions(&a);
     for v in &recorded {
-        let env = list2cart_sync::trust::SignedVersionEnvelope {
+        let env = syncnet::trust::SignedVersionEnvelope {
             version_id: v.version_id.clone(),
             entity: v.entity.clone(),
             entity_id: v.entity_id.clone(),
@@ -2284,8 +2284,7 @@ fn reopened_replica_does_not_resign_received_data_or_seed_a_new_catalog() {
     b.conn
         .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
         .unwrap();
-    list2cart_sync::identity::save_key_exclusive(&key_path(&path, "device"), &b.identity.key)
-        .unwrap();
+    syncnet::identity::save_key_exclusive(&key_path(&path, "device"), &b.identity.key).unwrap();
     let reopened = Database::open(&path).unwrap();
     assert_eq!(count(&reopened) as usize, before.len());
     assert_eq!(
@@ -2372,7 +2371,7 @@ fn legacy_database_is_adopted_once_without_forging_the_historical_author() {
 
 #[test]
 fn local_writes_after_a_future_peer_keep_order_time_and_independent_ids() {
-    use list2cart_sync::trust::SignedVersionEnvelope;
+    use syncnet::trust::SignedVersionEnvelope;
     let a = Database::open_in_memory().unwrap();
     let b = join_for_test(&a);
     let list = a.create_shopping_list("Clock test", None).unwrap();
@@ -2442,7 +2441,7 @@ fn unsigned_legacy_future_uuid_cannot_poison_the_signed_clock() {
 
 #[test]
 fn local_shared_list_mutation_requires_write_grant_and_inherits_the_channel() {
-    use list2cart_sync::trust::ListPermission;
+    use syncnet::trust::ListPermission;
     let db = Database::open_in_memory().unwrap();
     let scratch = Database::open_in_memory().unwrap();
     let network =
@@ -2517,4 +2516,346 @@ fn local_shared_list_mutation_requires_write_grant_and_inherits_the_channel() {
         .collect();
     assert_eq!(local.len(), 2);
     assert!(local.iter().all(|v| v.grant_ref == "write-grant"));
+}
+
+#[test]
+fn import_sync_package_json_routes_encrypted_v2_and_legacy_v1_cleanly() {
+    let source = Database::open_in_memory().unwrap();
+    let replica = join_for_test(&source);
+    let sender = source.sync_identity().device_public_key;
+    let membership: String = source
+        .conn
+        .query_row(
+            "SELECT raw_json FROM sync_trust_records WHERE kind='membership' AND subject_key=?1",
+            [&sender],
+            |r| r.get(0),
+        )
+        .unwrap();
+    store_control_record(
+        &replica.conn,
+        &source.identity.network_public,
+        &serde_json::from_str::<ControlPayload>(&membership).unwrap(),
+        Utc::now().timestamp(),
+    )
+    .unwrap();
+    let store = source.add_store("V2 Dućan", "Split", "#1768D1").unwrap();
+    let list = source
+        .create_shopping_list("V2 Tjedni popis", Some(store.id))
+        .unwrap();
+    source
+        .add_planned_item(list.id, None, "Kava", 1.0, Unit::Kom, 450)
+        .unwrap();
+
+    let req = replica.sync_request(&sender).unwrap();
+    let v2_page = source.sync_reply(&req, 256 * 1024).unwrap();
+    let v2_json = serde_json::to_string(&v2_page).unwrap();
+
+    // Stranger database cannot import a recipient-bound v2 package.
+    let stranger = Database::open_in_memory().unwrap();
+    assert!(stranger.import_sync_package_json(&v2_json).is_err());
+
+    // Intended recipient imports the v2 package through import_sync_package_json.
+    let (stores, _, lists) = replica.import_sync_package_json(&v2_json).unwrap();
+    assert!(stores >= 1);
+    assert!(lists >= 1);
+    assert_eq!(replica.list_shopping_lists().unwrap().len(), 1);
+    assert_eq!(replica.list_shopping_lists().unwrap()[0].items.len(), 1);
+}
+
+#[tokio::test]
+async fn live_tls13_pairing_controller_admits_only_on_mutual_confirm_and_persists_across_reopen() {
+    use crate::pairing_session::PairingController;
+    use std::sync::Mutex;
+    use syncnet::tls::{accept_exchange_on, dial_exchange_on};
+
+    let dir = TestDir::new();
+    let path_a = dir.0.join("admin.sqlite");
+    let path_b = dir.0.join("joiner.sqlite");
+
+    let db_a = Mutex::new(Database::open(&path_a).unwrap());
+    let db_b = Mutex::new(Database::open(&path_b).unwrap());
+
+    let ctrl_a = PairingController::new();
+    let ctrl_b = PairingController::new();
+
+    // 1. First attempt: A listens, B dials, both see the same SAS, but B refuses -> NO membership created!
+    let (sk_a, id_a, can_admit_a) = {
+        let a = db_a.lock().unwrap();
+        let sync_id = a.sync_identity();
+        (
+            a.clone_device_signing_key(),
+            PairingController::build_pair_identity(
+                &sync_id.device_public_key,
+                "Glavni mobitel",
+                "list2cart",
+            ),
+            a.can_admit_members().unwrap(),
+        )
+    };
+    let (sk_b, id_b, can_admit_b) = {
+        let b = db_b.lock().unwrap();
+        let sync_id = b.sync_identity();
+        (
+            b.clone_device_signing_key(),
+            PairingController::build_pair_identity(
+                &sync_id.device_public_key,
+                "Laptop doma",
+                "list2cart",
+            ),
+            b.can_admit_members().unwrap(),
+        )
+    };
+
+    let st_listen = ctrl_a
+        .start_listening(
+            "127.0.0.1:0".parse().unwrap(),
+            sk_a.clone(),
+            id_a.clone(),
+            can_admit_a,
+        )
+        .await
+        .unwrap();
+    assert!(st_listen.waiting);
+    let port = st_listen.listen_port.unwrap();
+
+    let st_b = ctrl_b
+        .dial(
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            sk_b.clone(),
+            id_b.clone(),
+            can_admit_b,
+        )
+        .await
+        .unwrap();
+    assert!(st_b.pending);
+
+    // Wait briefly for listener task to record pending state
+    for _ in 0..40 {
+        if ctrl_a.status(can_admit_a).pending {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let st_a = ctrl_a.status(can_admit_a);
+    assert!(st_a.pending);
+    assert_eq!(st_a.sas, st_b.sas);
+    assert_eq!(st_a.sas.as_ref().unwrap().len(), 6);
+
+    // B rejects while A approves
+    let confirm_a = ctrl_a.confirm(&db_a, true, PeerRole::OwnDevice, "*", true);
+    let confirm_b = ctrl_b.confirm(&db_b, false, PeerRole::OwnDevice, "*", false);
+    let (out_a, out_b) = tokio::join!(confirm_a, confirm_b);
+    let out_a = out_a.unwrap();
+    let out_b = out_b.unwrap();
+    assert!(!out_a.paired && !out_b.paired);
+    assert!(db_a.lock().unwrap().list_members().unwrap().is_empty());
+    assert!(db_b.lock().unwrap().list_members().unwrap().is_empty());
+
+    // 2. Second attempt: both sides approve -> B joins A's network, persists across disk reopen, and syncs!
+    let st_listen2 = ctrl_a
+        .start_listening(
+            "127.0.0.1:0".parse().unwrap(),
+            sk_a.clone(),
+            id_a.clone(),
+            can_admit_a,
+        )
+        .await
+        .unwrap();
+    let port2 = st_listen2.listen_port.unwrap();
+    let st_b2 = ctrl_b
+        .dial(
+            format!("127.0.0.1:{port2}").parse().unwrap(),
+            sk_b.clone(),
+            id_b.clone(),
+            can_admit_b,
+        )
+        .await
+        .unwrap();
+    for _ in 0..40 {
+        if ctrl_a.status(can_admit_a).pending {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let st_a2 = ctrl_a.status(can_admit_a);
+    assert_eq!(st_a2.sas, st_b2.sas);
+
+    let (ok_a, ok_b) = tokio::join!(
+        ctrl_a.confirm(&db_a, true, PeerRole::OwnDevice, "*", true),
+        ctrl_b.confirm(&db_b, true, PeerRole::OwnDevice, "*", false),
+    );
+    let ok_a = ok_a.unwrap();
+    let ok_b = ok_b.unwrap();
+    assert!(ok_a.paired && ok_a.member && ok_a.admitted);
+    assert!(ok_b.paired && ok_b.member);
+
+    // Reopen both databases from disk and verify identity bindings and zero store conflicts
+    drop(db_a);
+    drop(db_b);
+    let reopened_a = Database::open(&path_a).unwrap();
+    let reopened_b = Database::open(&path_b).unwrap();
+    assert_eq!(
+        reopened_a.sync_identity().network_public_key,
+        reopened_b.sync_identity().network_public_key
+    );
+    assert_eq!(
+        reopened_a.sync_identity().principal_id,
+        reopened_b.sync_identity().principal_id
+    );
+
+    // Authenticated TLS 1.3 exchange gate accepts the paired peer
+    let (c_io, s_io) = tokio::io::duplex(32 * 1024);
+    let a_pub_bytes = sk_a.verifying_key().to_bytes();
+    let b_creds = reopened_b.tls_credentials().unwrap();
+    let sk_a_srv = reopened_a.clone_device_signing_key();
+    let reopened_a_mutex = std::sync::Arc::new(Mutex::new(reopened_a));
+    let a_for_gate = reopened_a_mutex.clone();
+    let srv = tokio::spawn(async move {
+        accept_exchange_on(s_io, &sk_a_srv, "list2cart", None, move |pk, creds| {
+            a_for_gate
+                .lock()
+                .unwrap()
+                .verify_or_recover_peer_access(pk, creds)
+                .unwrap_or(false)
+        })
+        .await
+    });
+    let cli = dial_exchange_on(
+        c_io,
+        &reopened_b.clone_device_signing_key(),
+        "list2cart",
+        Some(std::sync::Arc::new(move || b_creds.clone())),
+        "127.0.0.1:4610",
+        &a_pub_bytes,
+    )
+    .await
+    .expect("paired exchange dial");
+    let srv_stream = srv.await.unwrap().expect("paired exchange accept");
+    assert_eq!(cli.peer_key, a_pub_bytes);
+    assert_eq!(srv_stream.peer_key, sk_b.verifying_key().to_bytes());
+}
+
+#[test]
+fn unilateral_finish_recovery_recovers_via_tls_credentials_and_idempotent_repairing() {
+    use syncnet::pairing::PairHello;
+
+    // Case 1: Joiner B finalized pairing (`WelcomePack`), but Admin A lost connection before `finalize_pairing`.
+    let admin = Database::open_in_memory().unwrap();
+    let mut joiner = Database::open_in_memory().unwrap();
+
+    let admin_key_bytes = admin.clone_device_signing_key().verifying_key().to_bytes();
+    let joiner_key_bytes = joiner.clone_device_signing_key().verifying_key().to_bytes();
+    let joiner_b64 = joiner.sync_identity().device_public_key;
+
+    let welcome_for_b = admin
+        .prepare_welcome_pack(&joiner_key_bytes, PeerRole::OwnDevice, "*", true)
+        .unwrap();
+
+    // Admin has NOT written B's membership to SQLite yet!
+    assert!(
+        !admin
+            .verify_or_recover_peer_access(&joiner_key_bytes, None)
+            .unwrap()
+    );
+
+    // Joiner B receives `welcome_for_b` and commits locally
+    let admin_hello = PairHello {
+        protocol: "list2cart".into(),
+        device_id: admin.sync_identity().device_public_key,
+        name: "Admin".into(),
+        version: "0.1.0".into(),
+        meta: BTreeMap::new(),
+        sas: 2,
+    };
+    let out_b = joiner
+        .finalize_pairing(
+            &admin_hello,
+            &admin_key_bytes,
+            "123456",
+            PeerRole::OwnDevice,
+            "*",
+            None,
+            Some(&welcome_for_b),
+        )
+        .unwrap();
+    assert!(out_b.paired && out_b.member);
+
+    // Now Joiner B connects to Admin A presenting its `tls_credentials()` in the TLS 1.3 cert SAN.
+    // Admin A verifies and atomically recovers Joiner B's membership!
+    let joiner_creds = joiner.tls_credentials().unwrap();
+    assert!(joiner_creds.is_some());
+    assert!(
+        admin
+            .verify_or_recover_peer_access(&joiner_key_bytes, joiner_creds.as_deref())
+            .unwrap(),
+        "Admin must recover unilaterally finalized membership from TLS credentials"
+    );
+
+    // Subsequent sync_request -> sync_reply -> import_sync_page succeeds with 0 store conflicts!
+    admin
+        .create_shopping_list("Oporavljeni popis", None)
+        .unwrap();
+    let req = joiner
+        .sync_request(&admin.sync_identity().device_public_key)
+        .unwrap();
+    let reply = admin.sync_reply(&req, 256 * 1024).unwrap();
+    joiner.import_sync_page(&reply).unwrap();
+    assert_eq!(joiner.list_shopping_lists().unwrap().len(), 1);
+    assert!(joiner.identity_conflicts().unwrap().is_empty());
+
+    // Case 2: Admin A finalized pairing, Joiner C lost connection before receiving WelcomePack, then re-pairs.
+    let mut joiner_c = Database::open_in_memory().unwrap();
+    let c_key_bytes = joiner_c
+        .clone_device_signing_key()
+        .verifying_key()
+        .to_bytes();
+    let c_hello = PairHello {
+        protocol: "list2cart".into(),
+        device_id: joiner_c.sync_identity().device_public_key,
+        name: "Joiner C".into(),
+        version: "0.1.0".into(),
+        meta: BTreeMap::new(),
+        sas: 2,
+    };
+    let welcome_c1 = admin
+        .prepare_welcome_pack(&c_key_bytes, PeerRole::FamilyMember, "*", true)
+        .unwrap();
+    let mut admin = admin;
+    admin
+        .finalize_pairing(
+            &c_hello,
+            &c_key_bytes,
+            "654321",
+            PeerRole::FamilyMember,
+            "*",
+            Some(&welcome_c1),
+            None,
+        )
+        .unwrap();
+
+    // Re-pairing between Admin A and Joiner C reuses C's membership cleanly without conflict
+    let welcome_c2 = admin
+        .prepare_welcome_pack(&c_key_bytes, PeerRole::FamilyMember, "*", true)
+        .unwrap();
+    assert_eq!(
+        welcome_c1.for_you.as_ref().unwrap().principal_id,
+        welcome_c2.for_you.as_ref().unwrap().principal_id
+    );
+    let out_c = joiner_c
+        .finalize_pairing(
+            &admin_hello,
+            &admin_key_bytes,
+            "654321",
+            PeerRole::FamilyMember,
+            "*",
+            None,
+            Some(&welcome_c2),
+        )
+        .unwrap();
+    assert!(out_c.paired && out_c.member);
+    assert_eq!(
+        joiner_c.sync_identity().network_public_key,
+        admin.sync_identity().network_public_key
+    );
+    let _ = joiner_b64;
 }

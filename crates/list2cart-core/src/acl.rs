@@ -1,5 +1,5 @@
 //! Stable control identities and scoped, conservative revocation decisions.
-use list2cart_sync::trust::Ovlast;
+use syncnet::trust::Ovlast;
 use uuid::Uuid;
 
 pub(crate) fn atomic(
@@ -35,21 +35,35 @@ pub(crate) fn historical_membership(
     network: &ed25519_dalek::VerifyingKey,
     key: &str,
     at: i64,
-) -> Result<Option<list2cart_sync::trust::Membership>, String> {
-    let mut newest: Option<list2cart_sync::trust::Membership> = None;
+) -> Result<Option<syncnet::trust::Membership>, String> {
+    let mut newest: Option<syncnet::trust::Membership> = None;
+    let mut seen_issued = std::collections::BTreeMap::<i64, Vec<u8>>::new();
+    let mut seen_principal: Option<String> = None;
     for raw in control_history(conn, "membership", key)? {
         let crate::models::ControlPayload::Membership(member) =
             serde_json::from_str(&raw).map_err(|e| format!("Neispravan povijesni dokaz: {e}"))?
         else {
             continue;
         };
-        if newest.as_ref().is_some_and(|old| {
-            member.issued_at == old.issued_at && member.signed_bytes() != old.signed_bytes()
-        }) {
-            return Err("Dvosmisleno povijesno članstvo".into());
+        if member.device_key != key {
+            continue;
         }
-        if member.device_key == key
-            && member.issued_at <= at
+        let signed = member.signed_bytes();
+        if let Some(prev) = seen_issued.get(&member.issued_at) {
+            if *prev != signed {
+                return Err("Dvosmisleno povijesno članstvo".into());
+            }
+        } else {
+            seen_issued.insert(member.issued_at, signed);
+        }
+        if let Some(ref principal) = seen_principal {
+            if *principal != member.principal_id {
+                return Err("Povijesno članstvo ne smije promijeniti principal".into());
+            }
+        } else {
+            seen_principal = Some(member.principal_id.clone());
+        }
+        if member.issued_at <= at
             && newest
                 .as_ref()
                 .is_none_or(|old| member.issued_at > old.issued_at)
@@ -62,7 +76,7 @@ pub(crate) fn historical_membership(
     };
     // Select the latest issuance first: expiry or a downgrade must not fall
     // through to an older, more permissive certificate.
-    let public = list2cart_sync::identity::parse_public_key(key).map_err(|e| e.to_string())?;
+    let public = syncnet::identity::parse_public_key(key).map_err(|e| e.to_string())?;
     if member.verify(network, &public, at).is_err()
         || check_delegation_at(conn, network, member.admitter.as_ref(), member.issued_at).is_err()
         || revoked(conn, "membership", key, &member.device_id)?
@@ -82,19 +96,25 @@ pub(crate) fn historical_admin(
         return Ok(false);
     }
     let mut newest: Option<Ovlast> = None;
+    let mut seen_issued = std::collections::BTreeMap::<i64, Vec<u8>>::new();
     for raw in control_history(conn, "ovlast", key)? {
         let crate::models::ControlPayload::Ovlast(authority) =
             serde_json::from_str(&raw).map_err(|e| format!("Neispravan povijesni dokaz: {e}"))?
         else {
             continue;
         };
-        if newest.as_ref().is_some_and(|old| {
-            authority.issued_at == old.issued_at && authority.signed_bytes() != old.signed_bytes()
-        }) {
-            return Err("Dvosmislena povijesna ovlast".into());
+        if authority.device_key != key {
+            continue;
         }
-        if authority.device_key == key
-            && authority.issued_at <= at
+        let signed = authority.signed_bytes();
+        if let Some(prev) = seen_issued.get(&authority.issued_at) {
+            if *prev != signed {
+                return Err("Dvosmislena povijesna ovlast".into());
+            }
+        } else {
+            seen_issued.insert(authority.issued_at, signed);
+        }
+        if authority.issued_at <= at
             && newest
                 .as_ref()
                 .is_none_or(|old| authority.issued_at > old.issued_at)
@@ -136,11 +156,20 @@ pub(crate) fn may_store(conn: &Connection, value: ControlIdentity<'_>) -> Result
         for raw in control_history(conn, value.kind, value.subject)? {
             let previous: crate::models::ControlPayload = serde_json::from_str(&raw)
                 .map_err(|e| format!("Neispravan povijesni dokaz: {e}"))?;
-            let issued = match previous {
-                crate::models::ControlPayload::Membership(m) => m.issued_at,
-                crate::models::ControlPayload::Ovlast(o) => o.issued_at,
+            let (issued, same_target) = match previous {
+                crate::models::ControlPayload::Membership(m) => {
+                    (m.issued_at, m.principal_id == value.target)
+                }
+                crate::models::ControlPayload::Ovlast(o) => {
+                    (o.issued_at, o.device_id == value.target)
+                }
                 _ => continue,
             };
+            if !same_target {
+                return Err(
+                    "Kontrolni identitet ne smije promijeniti vrstu, ključ ili cilj".into(),
+                );
+            }
             if issued == value.issued && raw != value.raw {
                 return Err("Dvosmisleno povijesno izdavanje kontrolnog zapisa".into());
             }
@@ -198,12 +227,21 @@ pub(crate) fn check_delegation_at(
         return Ok(());
     };
     let mut effective: Option<Ovlast> = None;
+    let mut seen_issued = std::collections::BTreeMap::<i64, Vec<u8>>::new();
     for raw in control_history(conn, "ovlast", &embedded.device_key)? {
         let crate::models::ControlPayload::Ovlast(proof) =
             serde_json::from_str(&raw).map_err(|e| e.to_string())?
         else {
             continue;
         };
+        let signed = proof.signed_bytes();
+        if let Some(prev) = seen_issued.get(&proof.issued_at) {
+            if *prev != signed {
+                return Err("Dvosmislena povijesna ovlast".into());
+            }
+        } else {
+            seen_issued.insert(proof.issued_at, signed);
+        }
         if proof.issued_at <= issued
             && effective
                 .as_ref()

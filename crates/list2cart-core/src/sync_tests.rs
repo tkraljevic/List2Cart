@@ -4,12 +4,10 @@ use crate::ledger::Version;
 use crate::models::{ControlPayload, PlannedItemSyncPayload, ShoppingListSyncPayload, Unit};
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
-use list2cart_sync::identity::verifying_key_to_base64;
-use list2cart_sync::trust::{
-    ListPermission, MemberRole, NetworkKey, SignedVersionEnvelope, Validity,
-};
 use rusqlite::{Connection, params};
 use std::collections::BTreeMap;
+use syncnet::identity::verifying_key_to_base64;
+use syncnet::trust::{ListPermission, MemberRole, NetworkKey, SignedVersionEnvelope, Validity};
 use uuid::Uuid;
 
 mod acl_tests;
@@ -165,7 +163,7 @@ fn state(conn: &Connection) -> (String, bool, bool) {
 #[test]
 fn revoking_one_list_grant_keeps_other_lists_and_membership_active() {
     use crate::apply::allowed_channels_for_recipient;
-    use list2cart_sync::trust::Revocation;
+    use syncnet::trust::Revocation;
     let db = Database::open_in_memory().unwrap();
     let conn = db.test_connection();
     let f = Fixture::new();

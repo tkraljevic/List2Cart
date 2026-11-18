@@ -11,13 +11,26 @@ use list2cart_core::{
     online::fetch_openfoodfacts_product,
     sync::sync_with_pocketbase_http,
 };
-use std::sync::Mutex;
-use tauri::{Manager, State};
+use std::sync::{Arc, Mutex};
+use tauri::{Emitter, Manager, State};
 
 pub struct AppState {
-    pub db: Mutex<Database>,
+    pub db: Arc<Mutex<Database>>,
     pub retail: list2cart_core::retail::RetailSearch,
+    pub pairing: list2cart_core::pairing_session::PairingController,
+    pub lan: Mutex<Option<Arc<list2cart_core::lan_service::LanSyncService>>>,
+    pub data_dir: std::path::PathBuf,
     pub export_dir: std::path::PathBuf,
+}
+
+impl AppState {
+    fn notify_lan_change(&self) {
+        if let Ok(guard) = self.lan.lock()
+            && let Some(svc) = guard.as_ref()
+        {
+            svc.notify_local_change();
+        }
+    }
 }
 
 #[tauri::command]
@@ -65,11 +78,15 @@ fn resolve_identity_conflict(
     keep_id: String,
     expected_ids: Vec<String>,
 ) -> Result<(), String> {
-    state
+    let res = state
         .db
         .lock()
         .map_err(|_| "Greska zakljucavanja baze")?
-        .resolve_identity_conflict(&entity, &keep_id, &expected_ids)
+        .resolve_identity_conflict(&entity, &keep_id, &expected_ids);
+    if res.is_ok() {
+        state.notify_lan_change();
+    }
+    res
 }
 
 #[tauri::command]
@@ -85,8 +102,14 @@ fn add_store(
     location: String,
     color: String,
 ) -> Result<Store, String> {
-    let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
-    db.add_store(&name, &location, &color)
+    let res = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        db.add_store(&name, &location, &color)
+    };
+    if res.is_ok() {
+        state.notify_lan_change();
+    }
+    res
 }
 
 #[tauri::command]
@@ -116,16 +139,22 @@ fn upsert_product(
     store_name: String,
     image_data_url: Option<String>,
 ) -> Result<Product, String> {
-    let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
-    db.upsert_product(&UpsertProductInput {
-        barcode: &barcode,
-        name: &name,
-        category: &category,
-        default_unit,
-        price_cents,
-        store_name: &store_name,
-        image_data_url: image_data_url.as_deref(),
-    })
+    let res = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        db.upsert_product(&UpsertProductInput {
+            barcode: &barcode,
+            name: &name,
+            category: &category,
+            default_unit,
+            price_cents,
+            store_name: &store_name,
+            image_data_url: image_data_url.as_deref(),
+        })
+    };
+    if res.is_ok() {
+        state.notify_lan_change();
+    }
+    res
 }
 
 #[tauri::command]
@@ -155,8 +184,14 @@ fn save_receipt(
     items: Vec<CartItem>,
     receipt_total_cents: i64,
 ) -> Result<ReceiptSummary, String> {
-    let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
-    db.save_receipt(store_id, &store_name, &items, receipt_total_cents)
+    let res = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        db.save_receipt(store_id, &store_name, &items, receipt_total_cents)
+    };
+    if res.is_ok() {
+        state.notify_lan_change();
+    }
+    res
 }
 
 #[tauri::command]
@@ -204,8 +239,14 @@ fn create_shopping_list(
     name: String,
     store_id: Option<i64>,
 ) -> Result<ShoppingList, String> {
-    let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
-    db.create_shopping_list(&name, store_id)
+    let res = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        db.create_shopping_list(&name, store_id)
+    };
+    if res.is_ok() {
+        state.notify_lan_change();
+    }
+    res
 }
 
 #[tauri::command]
@@ -218,15 +259,21 @@ fn add_planned_item(
     unit: Unit,
     estimated_price_cents: i64,
 ) -> Result<PlannedItem, String> {
-    let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
-    db.add_planned_item(
-        list_id,
-        barcode.as_deref(),
-        &name,
-        quantity,
-        unit,
-        estimated_price_cents,
-    )
+    let res = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        db.add_planned_item(
+            list_id,
+            barcode.as_deref(),
+            &name,
+            quantity,
+            unit,
+            estimated_price_cents,
+        )
+    };
+    if res.is_ok() {
+        state.notify_lan_change();
+    }
+    res
 }
 
 #[tauri::command]
@@ -235,8 +282,14 @@ fn toggle_planned_item(
     item_id: i64,
     checked: bool,
 ) -> Result<(), String> {
-    let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
-    db.toggle_planned_item(item_id, checked)
+    let res = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        db.toggle_planned_item(item_id, checked)
+    };
+    if res.is_ok() {
+        state.notify_lan_change();
+    }
+    res
 }
 
 #[tauri::command]
@@ -337,10 +390,360 @@ fn import_sync_bundle_json(
     state: State<'_, AppState>,
     json_str: String,
 ) -> Result<(usize, usize, usize), String> {
-    let bundle: list2cart_core::models::SyncBundle = serde_json::from_str(&json_str)
-        .map_err(|e| format!("Neispravna .list2cart datoteka: {e}"))?;
     let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
-    db.import_sync_bundle(&bundle)
+    db.import_sync_package_json(&json_str)
+}
+
+#[tauri::command]
+fn get_sync_identity(
+    state: State<'_, AppState>,
+) -> Result<list2cart_core::db::SyncIdentity, String> {
+    let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+    Ok(db.sync_identity())
+}
+
+#[tauri::command]
+fn create_sync_request(
+    state: State<'_, AppState>,
+    peer: String,
+) -> Result<list2cart_core::exchange::SyncRequest, String> {
+    let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+    db.sync_request(&peer)
+}
+
+#[tauri::command]
+fn create_sync_reply(
+    state: State<'_, AppState>,
+    request: list2cart_core::exchange::SyncRequest,
+    max_bytes: Option<usize>,
+) -> Result<String, String> {
+    let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+    let bundle = db.sync_reply(&request, max_bytes.unwrap_or(256 * 1024))?;
+    serde_json::to_string_pretty(&bundle).map_err(|e| format!("Greska serijalizacije: {e}"))
+}
+
+#[tauri::command]
+fn receive_sync_page(
+    state: State<'_, AppState>,
+    bundle_json: String,
+) -> Result<list2cart_core::exchange::SyncReceiveOutcome, String> {
+    let bundle: list2cart_core::apply::ProtectedBundleV2 = serde_json::from_str(&bundle_json)
+        .map_err(|e| format!("Neispravan zaštićeni v2 paket: {e}"))?;
+    let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+    db.import_sync_page(&bundle)
+}
+
+#[tauri::command]
+fn get_pair_status(
+    state: State<'_, AppState>,
+) -> Result<list2cart_core::pairing_session::PairStatusView, String> {
+    let can_admit = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        db.can_admit_members()?
+    };
+    Ok(state.pairing.status(can_admit))
+}
+
+#[tauri::command]
+async fn start_pair_listening(
+    state: State<'_, AppState>,
+    port: Option<u16>,
+    device_name: Option<String>,
+) -> Result<list2cart_core::pairing_session::PairStatusView, String> {
+    let (sk, identity, can_admit) = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        let sync_id = db.sync_identity();
+        let name = device_name
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "List2Cart uredjaj".to_owned());
+        (
+            db.clone_device_signing_key(),
+            list2cart_core::pairing_session::PairingController::build_pair_identity(
+                &sync_id.device_public_key,
+                &name,
+                list2cart_core::apply::PROTOCOL_NAME,
+            ),
+            db.can_admit_members()?,
+        )
+    };
+    let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], port.unwrap_or(0)));
+    let status = state
+        .pairing
+        .start_listening(bind_addr, sk, identity, can_admit)
+        .await?;
+    if let Some(listen_port) = status.listen_port {
+        let _ = list2cart_core::lan_service::write_pairing_flag(&state.data_dir, listen_port);
+    }
+    Ok(status)
+}
+
+#[tauri::command]
+fn stop_pair_listening(
+    state: State<'_, AppState>,
+) -> Result<list2cart_core::pairing_session::PairStatusView, String> {
+    list2cart_core::lan_service::clear_pairing_flag(&state.data_dir);
+    let can_admit = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        db.can_admit_members()?
+    };
+    Ok(state.pairing.stop_listening(can_admit))
+}
+
+#[tauri::command]
+async fn dial_pair_peer(
+    state: State<'_, AppState>,
+    addr: String,
+    device_name: Option<String>,
+) -> Result<list2cart_core::pairing_session::PairStatusView, String> {
+    let parsed_addr: std::net::SocketAddr = addr
+        .trim()
+        .parse()
+        .map_err(|e| format!("Neispravna adresa uredjaja (IP:port): {e}"))?;
+    let (sk, identity, can_admit) = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        let sync_id = db.sync_identity();
+        let name = device_name
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "List2Cart uredjaj".to_owned());
+        (
+            db.clone_device_signing_key(),
+            list2cart_core::pairing_session::PairingController::build_pair_identity(
+                &sync_id.device_public_key,
+                &name,
+                list2cart_core::apply::PROTOCOL_NAME,
+            ),
+            db.can_admit_members()?,
+        )
+    };
+    state
+        .pairing
+        .dial(parsed_addr, sk, identity, can_admit)
+        .await
+}
+
+#[tauri::command]
+async fn confirm_pair_peer(
+    state: State<'_, AppState>,
+    approved: bool,
+    role: Option<PeerRole>,
+    shared_lists: Option<String>,
+    admit: Option<bool>,
+) -> Result<list2cart_core::pairing_session::PairOutcomeView, String> {
+    let outcome = state
+        .pairing
+        .confirm(
+            &state.db,
+            approved,
+            role.unwrap_or(PeerRole::OwnDevice),
+            shared_lists.as_deref().unwrap_or("*"),
+            admit.unwrap_or(true),
+        )
+        .await?;
+    list2cart_core::lan_service::clear_pairing_flag(&state.data_dir);
+    if outcome.paired {
+        state.notify_lan_change();
+    }
+    Ok(outcome)
+}
+
+fn lan_status_snapshot(
+    state: &AppState,
+) -> Result<list2cart_core::lan_service::LanServiceStatus, String> {
+    if let Ok(guard) = state.lan.lock()
+        && let Some(svc) = guard.as_ref()
+    {
+        return Ok(svc.status());
+    }
+    let device_public_key = state
+        .db
+        .lock()
+        .map_err(|_| "Greska zakljucavanja baze".to_owned())?
+        .sync_identity()
+        .device_public_key;
+    Ok(list2cart_core::lan_service::LanServiceStatus {
+        running: false,
+        paused: false,
+        exchange_addr: String::new(),
+        discovery_addr: None,
+        device_public_key,
+        active_conversations: 0,
+        last_round_at: None,
+        last_error: Some("LAN servis nije pokrenut".to_owned()),
+        peers: Vec::new(),
+    })
+}
+
+fn emit_lan_status(app: &tauri::AppHandle, state: &AppState) {
+    if let Ok(status) = lan_status_snapshot(state) {
+        let _ = app.emit("lan-status-changed", status);
+    }
+}
+
+async fn spawn_lan_service(
+    db: Arc<Mutex<Database>>,
+    data_dir: std::path::PathBuf,
+) -> Result<Arc<list2cart_core::lan_service::LanSyncService>, String> {
+    let mut cfg = list2cart_core::lan_service::LanServiceConfig {
+        data_dir: Some(data_dir),
+        ..Default::default()
+    };
+    match list2cart_core::lan_service::LanSyncService::start(Arc::clone(&db), cfg.clone()).await {
+        Ok(svc) => Ok(Arc::new(svc)),
+        Err(err) => {
+            eprintln!("LAN discovery bind nije uspio ({err}); pokrecem bez UDP otkrivanja");
+            cfg.discovery_bind_addr = None;
+            list2cart_core::lan_service::LanSyncService::start(db, cfg)
+                .await
+                .map(Arc::new)
+        }
+    }
+}
+
+#[tauri::command]
+fn get_lan_status(
+    state: State<'_, AppState>,
+) -> Result<list2cart_core::lan_service::LanServiceStatus, String> {
+    lan_status_snapshot(&state)
+}
+
+#[tauri::command]
+async fn start_lan_sync(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<list2cart_core::lan_service::LanServiceStatus, String> {
+    let already_running = state
+        .lan
+        .lock()
+        .map_err(|_| "Greska zakljucavanja LAN servisa".to_owned())?
+        .as_ref()
+        .is_some_and(|svc| svc.status().running);
+    if !already_running {
+        let svc = spawn_lan_service(Arc::clone(&state.db), state.data_dir.clone()).await?;
+        let mut guard = state
+            .lan
+            .lock()
+            .map_err(|_| "Greska zakljucavanja LAN servisa".to_owned())?;
+        *guard = Some(svc);
+    }
+    let status = lan_status_snapshot(&state)?;
+    let _ = app.emit("lan-status-changed", &status);
+    Ok(status)
+}
+
+#[tauri::command]
+fn stop_lan_sync(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<list2cart_core::lan_service::LanServiceStatus, String> {
+    let existing = {
+        let mut guard = state
+            .lan
+            .lock()
+            .map_err(|_| "Greska zakljucavanja LAN servisa".to_owned())?;
+        guard.take()
+    };
+    if let Some(svc) = existing {
+        svc.stop();
+    }
+    let status = lan_status_snapshot(&state)?;
+    let _ = app.emit("lan-status-changed", &status);
+    Ok(status)
+}
+
+#[tauri::command]
+fn set_lan_paused(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    paused: bool,
+) -> Result<list2cart_core::lan_service::LanServiceStatus, String> {
+    {
+        let guard = state
+            .lan
+            .lock()
+            .map_err(|_| "Greska zakljucavanja LAN servisa".to_owned())?;
+        let svc = guard
+            .as_ref()
+            .ok_or_else(|| "LAN servis nije pokrenut".to_owned())?;
+        svc.set_paused(paused);
+    }
+    let status = lan_status_snapshot(&state)?;
+    let _ = app.emit("lan-status-changed", &status);
+    Ok(status)
+}
+
+#[tauri::command]
+async fn discover_lan_peers() -> Result<Vec<list2cart_core::lan_service::FoundPeer>, String> {
+    list2cart_core::lan_service::discover_lan_peers(std::time::Duration::from_millis(700)).await
+}
+
+#[tauri::command]
+async fn trigger_lan_sync(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let svc = {
+        let guard = state
+            .lan
+            .lock()
+            .map_err(|_| "Greska zakljucavanja LAN servisa".to_owned())?;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "LAN servis nije pokrenut".to_owned())?
+    };
+    let res = svc.sync_now().await;
+    emit_lan_status(&app, &state);
+    res
+}
+
+#[tauri::command]
+fn set_manual_peer_addr(
+    state: State<'_, AppState>,
+    peer_public_key: String,
+    addr: Option<String>,
+) -> Result<(), String> {
+    let parsed = match addr.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => Some(
+            raw.parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("Neispravna adresa partnera (IP:port): {e}"))?,
+        ),
+        None => None,
+    };
+    let guard = state
+        .lan
+        .lock()
+        .map_err(|_| "Greska zakljucavanja LAN servisa".to_owned())?;
+    let svc = guard
+        .as_ref()
+        .ok_or_else(|| "LAN servis nije pokrenut".to_owned())?;
+    svc.set_manual_peer_addr(&peer_public_key, parsed);
+    Ok(())
+}
+
+#[tauri::command]
+async fn sync_lan_peer_at(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    peer_public_key: String,
+    addr: String,
+) -> Result<list2cart_core::session::SessionOutcome, String> {
+    let parsed: std::net::SocketAddr = addr
+        .trim()
+        .parse()
+        .map_err(|e| format!("Neispravna adresa partnera (IP:port): {e}"))?;
+    let svc = {
+        let guard = state
+            .lan
+            .lock()
+            .map_err(|_| "Greska zakljucavanja LAN servisa".to_owned())?;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "LAN servis nije pokrenut".to_owned())?
+    };
+    let res = svc.sync_peer_at(&peer_public_key, parsed).await;
+    emit_lan_status(&app, &state);
+    res
 }
 
 #[tauri::command]
@@ -379,6 +782,9 @@ async fn sync_pocketbase(
         }
     }
     report.pulled_stores = applied;
+    if applied > 0 {
+        state.notify_lan_change();
+    }
     Ok(report)
 }
 
@@ -397,12 +803,34 @@ pub fn run() {
             let db_path = data_dir.join("list2cart.sqlite");
             let db = Database::open(&db_path)?;
 
-            let export_dir = app.path().download_dir().unwrap_or(data_dir);
+            let export_dir = app
+                .path()
+                .download_dir()
+                .unwrap_or_else(|_| data_dir.clone());
+            let db_arc = Arc::new(Mutex::new(db));
 
             app.manage(AppState {
-                db: Mutex::new(db),
+                db: Arc::clone(&db_arc),
                 retail: list2cart_core::retail::RetailSearch::default(),
+                pairing: list2cart_core::pairing_session::PairingController::new(),
+                lan: Mutex::new(None),
+                data_dir: data_dir.clone(),
                 export_dir,
+            });
+            let lan_handle = app.handle().clone();
+            let lan_db = Arc::clone(&db_arc);
+            let lan_data_dir = data_dir;
+            tauri::async_runtime::spawn(async move {
+                match spawn_lan_service(lan_db, lan_data_dir).await {
+                    Ok(svc) => {
+                        let state = lan_handle.state::<AppState>();
+                        if let Ok(mut guard) = state.lan.lock() {
+                            *guard = Some(svc);
+                        }
+                        emit_lan_status(&lan_handle, &state);
+                    }
+                    Err(err) => eprintln!("LAN servis se nije mogao pokrenuti: {err}"),
+                }
             });
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -457,6 +885,23 @@ pub fn run() {
             export_sync_bundle_json,
             save_sync_bundle_file,
             import_sync_bundle_json,
+            get_sync_identity,
+            create_sync_request,
+            create_sync_reply,
+            receive_sync_page,
+            get_pair_status,
+            start_pair_listening,
+            stop_pair_listening,
+            dial_pair_peer,
+            confirm_pair_peer,
+            get_lan_status,
+            start_lan_sync,
+            stop_lan_sync,
+            set_lan_paused,
+            discover_lan_peers,
+            trigger_lan_sync,
+            set_manual_peer_addr,
+            sync_lan_peer_at,
             get_ledger_stats,
             run_ledger_compact,
             set_network_name,

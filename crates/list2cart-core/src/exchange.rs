@@ -3,17 +3,15 @@ use crate::apply::{
     ApplyReport, ExportRequest, PROTOCOL_NAME, ProtectedSyncPayload,
     allowed_channels_for_recipient, export_protected_bundle_for_recipient, import_protected_bundle,
 };
-use crate::ledger::{
-    HoleRecord, get_confirmed_frontier, list_holes, recovery_keys, serialized_json_len,
-};
+use crate::ledger::{HoleRecord, get_confirmed_frontier, list_holes, serialized_json_len};
 use crate::recovery::{self, RecoveryContext, SnapshotProgress};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer};
-use list2cart_sync::identity::{parse_public_key, public_key_to_base64};
-use list2cart_sync::wire::bundle_v2::ProtectedBundleV2;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use syncnet::identity::{parse_public_key, public_key_to_base64};
+use syncnet::wire::bundle_v2::ProtectedBundleV2;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,13 +189,20 @@ pub(crate) fn reply(
                 tx.commit().map_err(|e| e.to_string())?;
             } else if !already_complete {
                 ctx.conn.execute("UPDATE sync_snapshot_sessions SET next_offset=MAX(next_offset,?1) WHERE direction='out' AND snapshot_id=?2 AND peer_key=?3",params![progress.next_offset as u32,progress.snapshot_id,peer]).map_err(|e|e.to_string())?;
-                return recovery::export_page(
+                match recovery::export_page(
                     ctx,
                     &progress.snapshot_id,
                     peer,
                     progress.next_offset,
                     max_bytes,
-                );
+                ) {
+                    Ok(bundle) => return Ok(bundle),
+                    Err(err) if err.contains("ovlasti su promijenjene") => {
+                        recovery::discard(ctx.conn, &progress.snapshot_id, peer, true)?;
+                        replace_lost_snapshot = true;
+                    }
+                    Err(err) => return Err(err),
+                }
             } else {
                 replace_lost_snapshot = true;
             }
@@ -208,11 +213,38 @@ pub(crate) fn reply(
     // Reuse an unacknowledged frozen copy after a lost first response/restart.
     let active:Option<String>=ctx.conn.query_row("SELECT snapshot_id FROM sync_snapshot_sessions WHERE direction='out' AND peer_key=?1 AND complete=0 ORDER BY rowid DESC LIMIT 1",[peer],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
     if let Some(id) = active {
-        return recovery::export_page(ctx, &id, peer, 0, max_bytes);
+        match recovery::export_page(ctx, &id, peer, 0, max_bytes) {
+            Ok(bundle) => return Ok(bundle),
+            Err(err) if err.contains("ovlasti su promijenjene") => {
+                recovery::discard(ctx.conn, &id, peer, true)?;
+                replace_lost_snapshot = true;
+            }
+            Err(err) => return Err(err),
+        }
     }
     let allowed = allowed_channels_for_recipient(ctx.conn, ctx.network, peer, ctx.now)?;
+    let mut relayable_ids: std::collections::BTreeSet<String> = if allowed.contains("control") {
+        crate::apply::relayable_control_versions(ctx.conn, ctx.network, ctx.now)?
+            .into_iter()
+            .map(|v| v.version_id)
+            .collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    relayable_ids.extend(
+        crate::apply::relayable_domain_versions(ctx.conn, ctx.network, &allowed, ctx.now)?
+            .into_iter()
+            .map(|v| v.version_id),
+    );
     if replace_lost_snapshot
-        || !recovery_keys(ctx.conn, &request.frontier, &request.holes, &allowed)?.is_empty()
+        || !crate::ledger::recovery_keys_filtered(
+            ctx.conn,
+            &request.frontier,
+            &request.holes,
+            &allowed,
+            Some(&relayable_ids),
+        )?
+        .is_empty()
         || crate::backfill::needs_recovery(ctx.conn, &allowed, &request.backfill_revisions)?
     {
         let manifest = recovery::start(ctx, peer)?;

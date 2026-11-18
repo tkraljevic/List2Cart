@@ -8,12 +8,12 @@ use crate::ledger::{
     update_peer_ack,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use list2cart_sync::identity::{parse_public_key, public_key_to_base64};
-use list2cart_sync::wire::bundle_v2::ProtectedBundleV2;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use syncnet::identity::{parse_public_key, public_key_to_base64};
+use syncnet::wire::bundle_v2::ProtectedBundleV2;
 use uuid::Uuid;
 
 const MAX_ITEMS: usize = 100_000;
@@ -219,33 +219,47 @@ fn start_inner(
     if family {
         channels = family_scope(&ctx, recipient)?;
     }
-    if list_holes(&tx)?
+    let relayable_controls = if !family && channels.contains("control") {
+        crate::apply::relayable_control_versions(&tx, ctx.network, ctx.now)?
+    } else {
+        Vec::new()
+    };
+    let relayable_control_authors: BTreeSet<&str> = relayable_controls
         .iter()
-        .any(|hole| channels.contains(&hole.channel) && (!family || hole.channel != "control"))
-    {
+        .map(|v| v.node_id.as_str())
+        .collect();
+    let relayable_domains =
+        crate::apply::relayable_domain_versions(&tx, ctx.network, &channels, ctx.now)?;
+    let relayable_authors: BTreeSet<(&str, &str)> = relayable_domains
+        .iter()
+        .map(|v| (v.node_id.as_str(), v.channel.as_str()))
+        .collect();
+    if list_holes(&tx)?.iter().any(|hole| {
+        channels.contains(&hole.channel)
+            && (!family || hole.channel != "control")
+            && if hole.channel == "control" {
+                relayable_control_authors.contains(hole.author_node_id.as_str())
+            } else {
+                relayable_authors.contains(&(hole.author_node_id.as_str(), hole.channel.as_str()))
+            }
+    }) {
         return Err("Izvor ima nepotvrđene rupe; ne može jamčiti potpuni snapshot".into());
     }
     let versions = {
-        let mut stmt = tx.prepare("SELECT version_id,entity,entity_id,node_id,supersedes,archived,payload,created_at,schema_version,channel,author_pub_key,grant_ref,signature,created_at_unix FROM record_versions WHERE signature!='' AND legacy_imported=0 ORDER BY CASE WHEN channel='control' THEN 0 ELSE 1 END,version_id").map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], crate::ledger::read_version_row)
-            .map_err(|e| e.to_string())?;
         let mut result = if family {
             crate::family::proofs(
                 &tx,
+                ctx.network,
                 recipient,
                 &public_key_to_base64(ctx.network.as_bytes()),
                 &channels,
+                ctx.now,
             )?
         } else {
-            Vec::new()
+            relayable_controls
         };
         let mut bytes = serialized_json_len(&result)?;
-        for row in rows {
-            let v = row.map_err(|e| e.to_string())?;
-            if !channels.contains(&v.channel) || (family && v.channel == "control") {
-                continue;
-            }
+        for v in relayable_domains {
             bytes += serialized_json_len(&v)? + usize::from(!result.is_empty());
             if result.len() >= MAX_ITEMS || bytes > MAX_BYTES {
                 return Err("Snapshot prelazi ograničenje od 100.000 verzija / 64 MiB".into());
@@ -394,9 +408,11 @@ fn export_page_in_snapshot(
         family_access(&ctx, &manifest)?;
         let proofs = crate::family::proofs(
             ctx.conn,
+            ctx.network,
             recipient,
             &public_key_to_base64(ctx.network.as_bytes()),
             &manifest.channels,
+            ctx.now,
         )?;
         if Some(hash_versions(&proofs)?.0) != manifest.proof_sha256 {
             return Err(
@@ -407,6 +423,31 @@ fn export_page_in_snapshot(
     let allowed = allowed_channels_for_recipient(ctx.conn, ctx.network, recipient, ctx.now)?;
     if !manifest.channels.is_subset(&allowed) {
         return Err("Prava su promijenjena; započnite novi snapshot".into());
+    }
+    let mut relayable_ids: BTreeSet<String> = if manifest.channels.contains("control") {
+        crate::apply::relayable_control_versions(ctx.conn, ctx.network, ctx.now)?
+            .into_iter()
+            .map(|v| v.version_id)
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    relayable_ids.extend(
+        crate::apply::relayable_domain_versions(
+            ctx.conn,
+            ctx.network,
+            &manifest.channels,
+            ctx.now,
+        )?
+        .into_iter()
+        .map(|v| v.version_id),
+    );
+    let frozen = load_items(ctx.conn, "out", id, recipient, 0)?;
+    if frozen
+        .iter()
+        .any(|v| !relayable_ids.contains(&v.version_id))
+    {
+        return Err("Kontrolne ovlasti su promijenjene; započnite novi snapshot".into());
     }
     if offset >= manifest.total_versions {
         return Err("Neispravan nastavak snapshota".into());

@@ -13,7 +13,7 @@ fn export(
     budget: usize,
 ) -> Result<
     (
-        list2cart_sync::wire::bundle_v2::ProtectedBundleV2,
+        syncnet::wire::bundle_v2::ProtectedBundleV2,
         ProtectedSyncPayload,
         usize,
     ),
@@ -394,7 +394,7 @@ fn automatic_family_resumes_lost_reply_confirms_cleanup_and_returns_idle() {
         5000,
     )
     .unwrap();
-    let id = |page: &list2cart_sync::wire::bundle_v2::ProtectedBundleV2| {
+    let id = |page: &syncnet::wire::bundle_v2::ProtectedBundleV2| {
         let (plain, _) = page.open(crate::apply::PROTOCOL_NAME, &reader).unwrap();
         serde_json::from_slice::<serde_json::Value>(&plain).unwrap()["snapshot_page"]["manifest"]["snapshot_id"].as_str().unwrap().to_owned()
     };
@@ -867,7 +867,7 @@ fn family_snapshot_rejects_private_scope_global_ack_skip_and_changed_manifest() 
     let (plain, _) = bundle.open(crate::apply::PROTOCOL_NAME, &reader).unwrap();
     let original: serde_json::Value = serde_json::from_slice(&plain).unwrap();
     let seal = |value: &serde_json::Value| {
-        list2cart_sync::wire::bundle_v2::ProtectedBundleV2::seal(
+        syncnet::wire::bundle_v2::ProtectedBundleV2::seal(
             crate::apply::PROTOCOL_NAME,
             &f.root,
             reader.verifying_key().as_bytes(),
@@ -1252,7 +1252,7 @@ fn family_revocation_and_new_grant_are_replayed_even_above_old_control_frontier(
 fn family_delegation_proof_precedes_envelopes_even_with_later_wrapper_uuid() {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use ed25519_dalek::Signer;
-    use list2cart_sync::trust::{ListGrant, Membership};
+    use syncnet::trust::{ListGrant, Membership};
     let source = Database::open_in_memory().unwrap();
     let destination = Database::open_in_memory().unwrap();
     let f = Fixture::new();
@@ -1432,7 +1432,7 @@ fn family_foreign_own_device_does_not_receive_private_data_or_global_control_ack
             to_id: endpoint,
         },
     );
-    let bundle = list2cart_sync::wire::bundle_v2::ProtectedBundleV2::seal(
+    let bundle = syncnet::wire::bundle_v2::ProtectedBundleV2::seal(
         crate::apply::PROTOCOL_NAME,
         &f.root,
         reader.verifying_key().as_bytes(),

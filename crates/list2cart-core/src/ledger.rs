@@ -1,10 +1,10 @@
 use chrono::{Duration, Utc};
 use ed25519_dalek::SigningKey;
-use list2cart_sync::identity::public_key_to_base64;
-use list2cart_sync::trust::{MAX_CLOCK_SKEW_SECS, SignedVersionEnvelope};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use syncnet::identity::public_key_to_base64;
+use syncnet::trust::{MAX_CLOCK_SKEW_SECS, SignedVersionEnvelope};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,7 +82,7 @@ pub(crate) fn delta_byte_budget(max_bytes: usize) -> usize {
     } else {
         max_bytes
     })
-    .min(list2cart_sync::wire::bundle_v2::MAX_BUNDLE_PLAINTEXT)
+    .min(syncnet::wire::bundle_v2::MAX_BUNDLE_PLAINTEXT)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -830,18 +830,55 @@ fn load_compaction_floors(conn: &Connection) -> Result<BTreeMap<String, String>,
 }
 
 /// Shared decision for ordinary deltas and the automatic recovery dispatcher.
-pub(crate) fn recovery_keys(
+pub(crate) fn recovery_keys_filtered(
     conn: &Connection,
     peer_frontier: &BTreeMap<String, String>,
     requested_holes: &[HoleRecord],
     allowed_channels: &BTreeSet<String>,
+    relayable_ids: Option<&BTreeSet<String>>,
 ) -> Result<Vec<String>, String> {
     let floors = load_compaction_floors(conn)?;
+    let relayable_max = if let Some(ids) = relayable_ids {
+        let mut map = BTreeMap::<String, String>::new();
+        let mut stmt = conn
+            .prepare("SELECT version_id, node_id, channel FROM record_versions")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (vid, node, ch) = row.map_err(|e| e.to_string())?;
+            if ids.contains(&vid) {
+                let key = frontier_key(&node, &ch);
+                map.entry(key)
+                    .and_modify(|cur| {
+                        if vid > *cur {
+                            *cur = vid.clone();
+                        }
+                    })
+                    .or_insert(vid);
+            }
+        }
+        Some(map)
+    } else {
+        None
+    };
     Ok(floors
         .into_iter()
         .filter_map(|(key, floor)| {
             let (author, channel) = split_frontier_key(&key);
             if !allowed_channels.contains(channel) {
+                return None;
+            }
+            if let Some(ref max_map) = relayable_max
+                && !max_map.contains_key(&key)
+            {
                 return None;
             }
             let mut from = peer_frontier.get(&key).map(String::as_str).unwrap_or("");
@@ -854,7 +891,12 @@ pub(crate) fn recovery_keys(
                     from = &hole.from_version_id;
                 }
             }
-            (from < floor.as_str()).then_some(key)
+            let effective_floor = relayable_max
+                .as_ref()
+                .and_then(|m| m.get(&key))
+                .map(|max_id| floor.as_str().min(max_id.as_str()))
+                .unwrap_or(floor.as_str());
+            (from < effective_floor).then_some(key)
         })
         .collect())
 }
@@ -888,13 +930,64 @@ pub fn compute_delta_paged(
     allowed_channels: &BTreeSet<String>,
     max_bytes: usize,
 ) -> Result<DeltaBatch, String> {
+    compute_delta_paged_filtered(
+        conn,
+        peer_frontier,
+        requested_holes,
+        allowed_channels,
+        max_bytes,
+        None,
+    )
+}
+
+pub(crate) fn compute_delta_paged_filtered(
+    conn: &Connection,
+    peer_frontier: &BTreeMap<String, String>,
+    requested_holes: &[HoleRecord],
+    allowed_channels: &BTreeSet<String>,
+    max_bytes: usize,
+    relayable_ids: Option<&BTreeSet<String>>,
+) -> Result<DeltaBatch, String> {
     let budget = delta_byte_budget(max_bytes);
-    let mine = get_frontier(conn)?;
+    let mine = if let Some(ids) = relayable_ids {
+        let mut map = BTreeMap::<String, String>::new();
+        let mut stmt = conn
+            .prepare("SELECT version_id, node_id, channel FROM record_versions")
+            .map_err(|e| format!("Greska upita granice: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("Greska citanja granice: {e}"))?;
+        for row in rows {
+            let (vid, node, ch) = row.map_err(|e| format!("Greska retka granice: {e}"))?;
+            if ids.contains(&vid) {
+                let key = frontier_key(&node, &ch);
+                map.entry(key)
+                    .and_modify(|cur| {
+                        if vid > *cur {
+                            *cur = vid.clone();
+                        }
+                    })
+                    .or_insert(vid);
+            }
+        }
+        map
+    } else {
+        get_frontier(conn)?
+    };
     let local_holes = list_holes(conn)?;
 
     let mut holes_by_key: BTreeMap<String, VersionRange> = BTreeMap::new();
     for h in &local_holes {
         let k = frontier_key(&h.author_node_id, &h.channel);
+        if relayable_ids.is_some() && !mine.contains_key(&k) {
+            continue;
+        }
         holes_by_key.insert(
             k,
             VersionRange {
@@ -923,8 +1016,13 @@ pub fn compute_delta_paged(
             .or_insert_with(|| req.from_version_id.clone());
     }
 
-    let snapshot_reset_keys =
-        recovery_keys(conn, peer_frontier, requested_holes, allowed_channels)?;
+    let snapshot_reset_keys = recovery_keys_filtered(
+        conn,
+        peer_frontier,
+        requested_holes,
+        allowed_channels,
+        relayable_ids,
+    )?;
     let mut snapshot_versions = Vec::new();
     let mut reset_channels: BTreeSet<String> = BTreeSet::new();
 
@@ -942,19 +1040,23 @@ pub fn compute_delta_paged(
                             r.grant_ref, r.signature, r.created_at_unix
                      FROM record_versions r
                      WHERE r.channel = ?1
-                       AND r.version_id = (
-                           SELECT MAX(v.version_id) FROM record_versions v
-                           WHERE v.entity = r.entity AND v.entity_id = r.entity_id
-                       )
                      ORDER BY r.version_id ASC",
                 )
                 .map_err(|e| format!("Greska pripreme snapshot reset upita: {e}"))?;
             let rows = stmt
                 .query_map(params![ch], read_version_row)
                 .map_err(|e| format!("Greska citanja snapshot reset zapisa: {e}"))?;
+            let mut latest_by_entity = BTreeMap::<(String, String), Version>::new();
             for row in rows {
-                snapshot_versions.push(row.map_err(|e| format!("Greska snapshot retka: {e}"))?);
+                let v = row.map_err(|e| format!("Greska snapshot retka: {e}"))?;
+                if relayable_ids.is_some_and(|ids| !ids.contains(&v.version_id)) {
+                    continue;
+                }
+                latest_by_entity.insert((v.entity.clone(), v.entity_id.clone()), v);
             }
+            let mut ch_versions: Vec<Version> = latest_by_entity.into_values().collect();
+            ch_versions.sort_by(|a, b| a.version_id.cmp(&b.version_id));
+            snapshot_versions.extend(ch_versions);
         }
     }
 
@@ -986,6 +1088,9 @@ pub fn compute_delta_paged(
             .map_err(|e| format!("Greska citanja delte: {e}"))?;
         for row in rows {
             let v = row.map_err(|e| format!("Greska retka delte: {e}"))?;
+            if relayable_ids.is_some_and(|ids| !ids.contains(&v.version_id)) {
+                continue;
+            }
             if seen_ids.insert(v.version_id.clone()) {
                 candidates.push(v);
             }

@@ -1,5 +1,74 @@
 # Stanje preuzetog rada — 17. 11. 2026.
 
+## S15 — Tauri servis i korisnički tok (18. 11. 2026.)
+
+- Nadograđen `LanSyncService` (`crates/list2cart-core/src/lan_service.rs`) i Tauri servis (`src-tauri/src/lib.rs`) s jasnim lifecycle naredbama i tipiziranim događajima:
+  - Dodani `start_lan_sync`, `stop_lan_sync` i `set_lan_paused` uz emitiranje Tauri događaja `"lan-status-changed"` s tipiziranim stanjem (`LanServiceStatus { running, paused, exchange_addr, discovery_addr, device_public_key, active_conversations, last_round_at, last_error, peers }`), bez izlaganja privatnih ključeva u IPC-u ili događajima.
+  - `sync_pocketbase` i dalje upisuje isključivo trgovine preko potpisanog `db.add_store` zapisa promjena (ne zaobilazi knjigu verzija niti ovlasti) i obavještava LAN servis o novim podacima.
+- Nadograđeni `src/api.ts`, `src/main.ts` i `src/styles.css`:
+  - **Obitelj i uređaji (`renderSync`)**: prikazuje živo stanje LAN servisa (aktivan / pauziran / zaustavljen), gumb za pokretanje/pauziranje/nastavak/zaustavljanje i ručno okidanje razmjene (`trigger_lan_sync`), te po svakom partneru zadnji put (`lan` / `manual`), adresu, vrijeme zadnjeg uspjeha, broj primljenih/poslanih verzija, razlog pogreške i unos/spremanje/razmjenu preko ručne `IP:port` adrese bez reseta unosa pri osvježavanju.
+  - **Stvarno mrežno uparivanje (`renderPairingDialog`)**: podržava stvarno TLS 1.3 uparivanje (slušanje na portu uz `pairing-port` flag, LAN pretragu s 1-klik spajanjem, izravni `IP:port` dial, prikaz stvarnog 6-znamenkastog commit–reveal SAS koda, javnog ključa i adrese partnera, odabir uloge i popisa, te obostranu potvrdu/odbijanje), uz zadržanu mogućnost ručne offline evidencije.
+  - **Sigurnost prikaza i CSP**: svi vanjski/primljeni nazivi, adrese, ključevi i poruke pogreške renderiraju se kroz `escapeHtml`, uz važeći strogi CSP u `src-tauri/tauri.conf.json` (`script-src 'self'`).
+- Opaženo: **115 core + 40 syncnet = 155 Rust testova**, **8 Bun UI testova**, `rustfmt`, strogi `clippy --workspace --all-targets -- -D warnings`, `cargo-deny` i `bun run build` prolaze.
+
+## S11 — fotografije i nedostajući sadržaj (18. 11. 2026.)
+
+- Implementiran `crates/list2cart-core/src/content.rs` i migracija `v7` u `crates/list2cart-core/src/migrations.rs`:
+  - Sadržaj se identificira SHA-256 hex otiskom (`sha256_hex`) uz provjeru veličine (`MAX_CONTENT_BYTES = 1.5 MiB`), dopuštenog rasterskog MIME tipa (`image/png`, `image/jpeg`, `image/webp`, `image/gif`; bez SVG/HTML) i magic-byte zaglavlja.
+  - Datotečno spremište (`<db_dir>/blobs/<hash>`) piše kroz privremenu `.part.<uuid>` datoteku uz `sync_all()` i atomski `fs::rename`, dok `:memory:` baze koriste inline SQLite BLOB u `content_blobs`. Pri svakom čitanju (`load_verified_blob`) ponovno se provjeravaju SHA-256 otisak i format, a parcijalne `.part.` datoteke nikad se ne smatraju dovršenim sadržajem.
+  - Postojeće inline `products.image_data_url` slike automatski se migriraju u `content_blobs` / `blobs/` i `products.image_hash` pri `Database::open` (`migrate_inline_product_images`), a `get_product` / `list_products` transparentno rekonstruiraju `data:` URL preko `hydrate_product_image`.
+  - Novi `ProductSyncPayload` zapisi (`db/local.rs`, `apply.rs`) nose samo `image_hash`, `image_mime` i `image_bytes` bez dupliranja base64 bajtova u `record_versions` i delta stranicama.
+  - `session.rs` (`run_conversation_round`) razmjenjuje stvarne `WantsMessage` i `ContentMessage` poruke: šalje se isključivo sadržaj vezan uz kanale kojima konkretan partner ima aktivno pravo pristupa (`allowed_channels_for_recipient`), već spremljeni otisci nikad se ne traže dvaput, a korumpirani ili neželjeni prilozi odbijaju se prije pohrane.
+  - `gc_unreferenced_content` (izvršava se u `run_scheduled_maintenance`, izvan mrežnog receive loopa) briše samo siročad-blobove i zastarjele `.part.` datoteke uz očuvanje slika na koje upućuju aktivni artikli ili zadržana povijest verzija.
+- Opaženo: **115 core + 40 sync = 155 Rust testova** i **8 Bun UI testova** prolazi; `rustfmt`, strogi `clippy --workspace --all-targets -- -D warnings`, `cargo-deny` i `bun run build` prolaze.
+
+## S10 — LAN discovery i automatska lokalna razmjena (18. 11. 2026.)
+
+- Implementirani `crates/list2cart-sync/src/transport/discovery.rs` i `crates/list2cart-sync/src/transport/lan.rs`:
+  - UDP LAN discovery protokol (`<protokol>-discover-v1`) s `Beacon` i `FoundPeer` zapisima, filtriranjem po nazivu protokola i nepraznom `deviceId`-u, uz ograničenje broja odgovora (`AnnouncerRateLimiter`: samo lokalne/loopback/private/link-local adrese, najviše 20 odgovora/s ukupno i 2 odgovora/s po izvorišnoj IP adresi).
+  - `discover_on` / `discover_lan` šalje sonde na `0 ms`, `150 ms` i `400 ms`, deduplicira odgovore po `deviceId`-u i završava ranije čim odgovore svi traženi uređaji; `announce_on_port` veže točan UDP port bez tihog fallbacka; `write_pairing_flag` / `read_pairing_flag` / `clear_pairing_flag` oglašavaju privremeni `pairPort` uz automatsko čišćenje zastarjelih oznaka.
+  - `ActivePeers` (najviše jedan aktivni razgovor po javnom ključu partnera), `CoalescedTrigger` (spajanje rafala lokalnih promjena unutar debounce prozora uz periodični sigurnosni krug) i `serve_tcp_listener` s ograničenjem istodobnih veza i čistim gašenjem na `CancellationToken`.
+- Dovršen `crates/list2cart-core/src/lan_service.rs`, `Database::list_active_sync_peers` u `crates/list2cart-core/src/db/local.rs` te Tauri/frontend povezivanje u `src-tauri/src/lib.rs` i `src/api.ts`:
+  - Automatsko pokretanje `LanSyncService`-a pri pokretanju aplikacije (uz fallback na ručni način bez UDP porta ako je discovery port zauzet), slušanje TLS 1.3 LAN razmjena, automatski poziv `notify_local_change()` nakon lokalnih mutacija baze te nove Tauri naredbe (`get_lan_status`, `discover_lan_peers`, `trigger_lan_sync`, `set_manual_peer_addr`, `sync_lan_peer_at`).
+  - Integracijski testovi potvrđuju automatsko LAN otkrivanje i konvergenciju nakon lokalne promjene, ručnu IP:port razmjenu bez UDP discoveryja, odbijanje lažnog beacona s krivim TLS ključem i čisto gašenje servisa.
+- Opaženo: **111 core + 40 sync = 151 Rust test** i **8 Bun UI testova** prolazi; `rustfmt`, strogi `clippy`, `cargo-deny` i `bun run build` prolaze.
+
+## S09 — neovisan protokol razgovora nad duplex tokom i TLS 1.3 vezom (18. 11. 2026.)
+
+- Implementirani `crates/list2cart-sync/src/wire/conversation.rs` i `crates/list2cart-core/src/session.rs`:
+  - Uokvirene poruke razgovora (`ConversationEnvelope`) s provjerom duljine po očekivanoj vrsti **prije alokacije**: `hello` (`64 KiB`), `request` (`128 KiB`), `page` (`2 MiB`), `zelje` (`64 KiB`), `sadrzaj` (`2 MiB`), `done` (`16 KiB`) i `odbijeno` (ograničeno prema očekivanoj vrsti poruke).
+  - Numerički kodovi odbijanja (`RefusalCode`: `General = 0x0100`, `UnknownChannel = 0x0101`, `Busy = 0x0102`, `Refused = 0x0103`, `NotAMember = 0x0104`, `WriteBusy = 0x0106`, `NoTailscale = 0x0107`) uz prepoznavanje zamrznutih v0.0.38 tekstova odbijenica i rezanje UTF-8 razloga (`512 B`), oznake programa (`128 B`), greške (`1024 B`), mogućnosti (`32`) i shema (`1024`).
+  - Strogi redoslijed slanja/primanja po ulozi (`exchange_step_by_role`: inicijator šalje i flusha prvi, primatelj prima prvi u svakom koraku) sprječava deadlock čak i kad oba partnera istodobno šalju velike stranice kroz mali `4 KiB` međuspremnik.
+  - `run_conversation_round` i `run_conversation_until_idle` izvode cjeloviti razgovor (`Hello` → `SyncRequest` → `ProtectedBundleV2` delta/snapshot stranica → atomska primjena u bazu bez držanja `Mutex<Database>` preko `.await` → `Wants/Content` ili prijevremeni `Done` → `Done`) kroz više krugova do konvergencije i potpisanog completion ACK-a, jednako nad testnim duplex tokom i nad TLS 1.3 vezom (`dial_and_run_conversation_on`, `accept_and_run_conversation_on`).
+- Opaženo: **108 core + 34 sync = 142 Rust testa** i **8 Bun UI testova** prolazi; strogi workspace Clippy, `rustfmt`, `cargo-deny` i `bun run build` prolaze.
+
+## S08 — ključevi, TLS 1.3 identitet, stvarni commit–reveal SAS i oporavak završetka (18. 11. 2026.)
+
+- Implementiran `crates/list2cart-sync/src/tls.rs`:
+  - Striktno TLS 1.3 međusobno autentificirano rukovanje (`Ed25519PeerVerifier`) s provjerom Ed25519 potpisa (`verify_tls13_signature`), odbijanjem TLS 1.2 i ne-Ed25519 certifikata te provjerom `CommonName == "<protokol>-sync"`.
+  - Odvojeni ALPN protokoli za uparivanje (`list2cart-pair/1`) i normalnu razmjenu (`list2cart-lan/1`, `list2cart-web/1`, `list2cart-sig/1`, `list2cart-tun/1`).
+  - `DynamicCertResolver` predmemorira samopotpisani X.509 certifikat s ugrađenim SAN vjerodajnicama (`urn:list2cart:vjerodajnice:<base64url>`) i obnavlja ga samo pri promjeni vjerodajnica.
+  - `dial_exchange_on` provjerava očekivani javni ključ partnera unutar `verify_server_cert` prije slanja aplikacijskih podataka (`TlsAuthError::DifferentPeerKey`), a `accept_exchange_on` provjerava članstvo/vjerodajnice unutar `verify_tls13_signature` (`TlsAuthError::UntrustedPeer`).
+  - `probe_peer_key_on` provjerava posjedovanje ključa poslužitelja u 1-RTT bez slanja klijentskog certifikata i bez otvaranja razmjene ili pozivanja `trusted` na poslužitelju.
+- Nadograđen `crates/list2cart-sync/src/pairing.rs` i dodan `crates/list2cart-core/src/pairing_session.rs`:
+  - Cjeloviti dvosmjerni `PairHello` (`sas = 2`), commit–reveal (`SasWireMessage`) i obostrana potvrda (`PairConfirm` + `WelcomePack`) nad 4-bajtnim uokvirenim TLS 1.3 tokom (`listen_pairing` ignorira ne-TLS sonde i nastavlja čekati pravog partnera).
+  - Prije obostrane potvrde (`finish(true, ...)` s `approved == true` s obje strane) u SQLite se ne upisuje nikakvo članstvo ni `network_members` redak.
+  - Definiran i testiran oporavak jednostrano dovršenog završnog upisa u oba smjera:
+    1. Ako primljeni uređaj spremi `WelcomePack`, a veza pukne prije nego izdavatelj potvrdi upis, pri idućem TLS 1.3 spajanju `verify_or_recover_peer_access` iz SAN vjerodajnica (`NodeCredentials`) provjerava potpisano članstvo i atomski ga upisuje u bazu izdavatelja.
+    2. Ako izdavatelj spremi članstvo, a primljeni uređaj izgubi vezu prije primitka `WelcomePack`-a, ponovljeno uparivanje idempotentno koristi postojeći `principal_id` i članstvo bez sukoba.
+  - `PairingController` i Tauri naredbe (`get_pair_status`, `start_pair_listening`, `stop_pair_listening`, `dial_pair_peer`, `confirm_pair_peer`) vraćaju isključivo javne metapodatke i SAS kod, bez izlaganja privatnih ključeva.
+- Opaženo: **105 core + 32 sync = 137 Rust testova** i **8 Bun UI testova** prolazi; strogi workspace Clippy, `rustfmt`, `cargo-deny` i `bun run build` prolaze.
+
+## S07 — snapshot oporavak s opozvanim autorima, delegacijama i zaštićeni v2/v1 uvoz (18. 11. 2026.)
+
+- Riješen otvoreni problem snapshot oporavka i prosljeđivanja kada izvorna baza u `record_versions` sadrži stare verzije naknadno opozvanog autora/granta, certifikate izdane preko opozvane ili skraćene `Ovlast` delegacije, ili neprojicirane ovisnosti u `pending_projections`:
+  - `relayable_control_versions` i `relayable_domain_versions` u `apply.rs` na izvoru izdvajaju samo kontrolne i domenske verzije koje prolaze aktualne provjere opoziva, delegacije (`check_delegation_at`), nepromjenjivosti identiteta i roditeljskih ovisnosti (`stores` → `receipts` → `receipt_items`, `products` → `price_history`, `shopping_lists` → `planned_items`).
+  - `acl.rs` (`historical_membership`, `historical_admin`, `check_delegation_at`, `may_store`) provjerava dvosmislena izdavanja s istim `issued_at` i promjene principala neovisno o redoslijedu redaka u povijesti.
+  - U `apply_remote_versions_in_transaction` redoslijed kontrolnih zapisa (`control_rank`) postavlja `Ovlast` (0), korijenske/`ovlast` opozive (1), delegirane opozive (2) i `Membership`/`ListGrant` (3), čime opoziv administratora u istom paketu uvijek prethodi njegovim delegiranim opozivima i certifikatima. Odbijena verzija na vrhu toka (bez više potvrđene verzije u `record_versions`) više ne stvara lažnu trajnu rupu u `sync_holes`.
+  - `recovery.rs`, `family.rs`, `ledger.rs` (`compute_delta_paged_filtered`, `recovery_keys_filtered`), `exchange.rs` i `family_exchange.rs` koriste filtrirani skup prenosivih verzija i automatski zamjenjuju zamrznuti izlazni snapshot ako naknadni opoziv poništi neku od zamrznutih verzija, te nakon potpisanog completion ACK-a mirno prelaze u `idle` delta odgovor bez beskonačne petlje oporavka.
+  - `Database::import_sync_package_json` i Tauri naredbe (`import_sync_bundle_json`, `get_sync_identity`, `create_sync_request`, `create_sync_reply`, `receive_sync_page`) usmjeravaju šifrirane/potpisane v2 pakete (`format_version = 2`) kroz `import_sync_page`, zadržavaju izolirani lokalni uvoz za legacy v1 (`version = 1`), a nepoznate verzije odbijaju atomski bez promjene baze.
+- Opaženo: **103 core + 24 sync = 127 Rust testova** i **8 Bun UI testova** prolazi; strogi workspace Clippy, `rustfmt`, `cargo-deny` i `bun run build` prolaze.
+
 ## S07 — redoslijed dokaza i opoziv prije odgođene projekcije (18. 11. 2026.)
 
 - Novi negativni test reproducirao je propust: valjano primljena stavka bez roditeljskog popisa ušla je u pending_projections, zatim je autor/grant opozvan, ali kasniji roditelj ipak je automatski projicirao stavku bez nove provjere prava.

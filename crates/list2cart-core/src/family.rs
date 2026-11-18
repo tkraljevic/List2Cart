@@ -1,13 +1,15 @@
 //! Recipient-scoped proof replay. A filtered control view has no global frontier:
 //! its signed proofs accompany every page and never acknowledge unseen controls.
 use crate::ledger::{
-    DeltaBatch, HoleRecord, Version, compute_delta_paged, read_version_row, serialized_json_len,
+    DeltaBatch, HoleRecord, Version, compute_delta_paged_filtered, read_version_row,
+    serialized_json_len,
 };
 use crate::models::ControlPayload;
+use ed25519_dalek::VerifyingKey;
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Needed {
     members: BTreeSet<String>,
     admins: BTreeSet<String>,
@@ -44,12 +46,18 @@ impl Needed {
         }
     }
 
-    fn extend(&mut self, ctrl: &ControlPayload) {
+    fn extend(&mut self, ctrl: &ControlPayload, root: &str) {
         let admin = match ctrl {
             ControlPayload::Membership(m) => m.admitter.as_ref(),
             ControlPayload::ListGrant(g) => {
                 self.grants.insert(g.grant_id.clone());
                 g.admitter.as_ref()
+            }
+            ControlPayload::Revocation(r) => {
+                if !r.signer_key.is_empty() && r.signer_key != root {
+                    self.admins.insert(r.signer_key.clone());
+                }
+                None
             }
             _ => None,
         };
@@ -59,19 +67,22 @@ impl Needed {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn page(
     conn: &Connection,
+    network_pub: &VerifyingKey,
     recipient: &str,
     root: &str,
     frontier: &BTreeMap<String, String>,
     holes: &[HoleRecord],
     channels: &BTreeSet<String>,
     budget: usize,
+    now_unix: i64,
 ) -> Result<DeltaBatch, String> {
     if !channels.contains("control") {
-        return compute_delta_paged(conn, frontier, holes, &BTreeSet::new(), budget);
+        return compute_delta_paged_filtered(conn, frontier, holes, &BTreeSet::new(), budget, None);
     }
-    let mut proofs = proofs(conn, recipient, root, channels)?;
+    let mut proofs = proofs(conn, network_pub, recipient, root, channels, now_unix)?;
     // Reserve the complete replayed proof set BEFORE domain pagination. One
     // extra comma joins the two version arrays (conservative if data is empty).
     let reserve = serialized_json_len(&proofs)? - 2 + usize::from(!proofs.is_empty());
@@ -79,12 +90,24 @@ pub(crate) fn page(
         .checked_sub(reserve)
         .filter(|n| *n > 0)
         .ok_or("Kontrolni dokazi ne stanu u obiteljsku stranicu; povećajte granicu do 1 MiB")?;
-    let domain_channels = channels
+    let domain_channels: BTreeSet<String> = channels
         .iter()
         .filter(|c| c.as_str() != "control")
         .cloned()
         .collect();
-    let mut batch = compute_delta_paged(conn, frontier, holes, &domain_channels, available)?;
+    let relayable_domain_ids: BTreeSet<String> =
+        crate::apply::relayable_domain_versions(conn, network_pub, &domain_channels, now_unix)?
+            .into_iter()
+            .map(|v| v.version_id)
+            .collect();
+    let mut batch = compute_delta_paged_filtered(
+        conn,
+        frontier,
+        holes,
+        &domain_channels,
+        available,
+        Some(&relayable_domain_ids),
+    )?;
     proofs.append(&mut batch.versions);
     batch.versions = proofs;
     if serialized_json_len(&batch)? > budget {
@@ -96,14 +119,28 @@ pub(crate) fn page(
 /// Signed dependency closure shared by replayed delta proofs and durable snapshots.
 pub(crate) fn proofs(
     conn: &Connection,
+    network_pub: &VerifyingKey,
     recipient: &str,
     root: &str,
     channels: &BTreeSet<String>,
+    now_unix: i64,
 ) -> Result<Vec<Version>, String> {
-    let mut needed = Needed::default();
+    let mut required_needed = Needed::default();
     if recipient != root {
-        needed.members.insert(recipient.to_owned());
+        required_needed.members.insert(recipient.to_owned());
     }
+    let relayable_domains =
+        crate::apply::relayable_domain_versions(conn, network_pub, channels, now_unix)?;
+    for v in &relayable_domains {
+        if v.author_pub_key != root {
+            required_needed.members.insert(v.author_pub_key.clone());
+            if v.channel.starts_with("list:") {
+                required_needed.grants.insert(v.grant_ref.clone());
+            }
+        }
+    }
+
+    let mut all_needed = required_needed.clone();
     let mut statement = conn.prepare(
         "SELECT author_pub_key,grant_ref,channel FROM record_versions WHERE channel!='control' AND signature!='' AND legacy_imported=0"
     ).map_err(|e| e.to_string())?;
@@ -119,9 +156,9 @@ pub(crate) fn proofs(
     for domain in domains {
         let (author, grant, channel) = domain.map_err(|e| e.to_string())?;
         if channels.contains(&channel) && author != root {
-            needed.members.insert(author);
+            all_needed.members.insert(author);
             if channel.starts_with("list:") {
-                needed.grants.insert(grant);
+                all_needed.grants.insert(grant);
             }
         }
     }
@@ -135,11 +172,17 @@ pub(crate) fn proofs(
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<Version>, _>>()
         .map_err(|e| e.to_string())?;
+    let relayable_ctrl_ids: BTreeSet<String> =
+        crate::apply::relayable_control_versions(conn, network_pub, now_unix)?
+            .into_iter()
+            .map(|v| v.version_id)
+            .collect();
     let mut entries = Vec::new();
     for version in controls {
         let ctrl: ControlPayload =
             serde_json::from_str(&version.payload).map_err(|e| e.to_string())?;
-        entries.push((version, ctrl));
+        let is_relayable = relayable_ctrl_ids.contains(&version.version_id);
+        entries.push((version, ctrl, is_relayable));
     }
     // Include cache-only proofs in dependency discovery, but never manufacture
     // an original author's signed envelope for them.
@@ -153,34 +196,59 @@ pub(crate) fn proofs(
         .map_err(|e| e.to_string())?;
     let cached = cached
         .iter()
-        .map(|raw| serde_json::from_str::<ControlPayload>(raw).map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|raw| {
+            let ctrl = serde_json::from_str::<ControlPayload>(raw).map_err(|e| e.to_string())?;
+            let is_relayable =
+                crate::apply::control_payload_is_relayable(conn, network_pub, &ctrl, now_unix)
+                    .is_ok();
+            Ok((ctrl, is_relayable))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let mut selected = BTreeSet::new();
     loop {
         let before = (
-            needed.members.len(),
-            needed.admins.len(),
-            needed.grants.len(),
+            required_needed.members.len(),
+            required_needed.admins.len(),
+            required_needed.grants.len(),
+            all_needed.members.len(),
+            all_needed.admins.len(),
+            all_needed.grants.len(),
             selected.len(),
         );
-        for (index, (version, ctrl)) in entries.iter().enumerate() {
-            if needed.includes(ctrl, recipient, channels) {
-                selected.insert(index);
-                needed.extend(ctrl);
+        for (index, (version, ctrl, is_relayable)) in entries.iter().enumerate() {
+            if *is_relayable && required_needed.includes(ctrl, recipient, channels) {
+                required_needed.extend(ctrl, root);
                 if version.author_pub_key != root {
-                    needed.admins.insert(version.author_pub_key.clone());
+                    required_needed
+                        .admins
+                        .insert(version.author_pub_key.clone());
+                }
+            }
+            if all_needed.includes(ctrl, recipient, channels) {
+                if *is_relayable {
+                    selected.insert(index);
+                }
+                all_needed.extend(ctrl, root);
+                if version.author_pub_key != root {
+                    all_needed.admins.insert(version.author_pub_key.clone());
                 }
             }
         }
-        for ctrl in &cached {
-            if needed.includes(ctrl, recipient, channels) {
-                needed.extend(ctrl);
+        for (ctrl, is_relayable) in &cached {
+            if *is_relayable && required_needed.includes(ctrl, recipient, channels) {
+                required_needed.extend(ctrl, root);
+            }
+            if all_needed.includes(ctrl, recipient, channels) {
+                all_needed.extend(ctrl, root);
             }
         }
         let after = (
-            needed.members.len(),
-            needed.admins.len(),
-            needed.grants.len(),
+            required_needed.members.len(),
+            required_needed.admins.len(),
+            required_needed.grants.len(),
+            all_needed.members.len(),
+            all_needed.admins.len(),
+            all_needed.grants.len(),
             selected.len(),
         );
         if before == after {
@@ -193,7 +261,7 @@ pub(crate) fn proofs(
     let mut admins = BTreeSet::new();
     let mut grants = BTreeSet::new();
     for index in selected {
-        let (version, ctrl) = &entries[index];
+        let (version, ctrl, _) = &entries[index];
         if let ControlPayload::Revocation(r) = ctrl
             && r.scope().is_err()
         {
@@ -214,14 +282,15 @@ pub(crate) fn proofs(
         }
         proofs.push(version.clone());
     }
-    if !needed.members.is_subset(&members)
-        || !needed.admins.is_subset(&admins)
-        || !needed.grants.is_subset(&grants)
+    if !required_needed.members.is_subset(&members)
+        || !required_needed.admins.is_subset(&admins)
+        || !required_needed.grants.is_subset(&grants)
     {
         return Err("Nedostaje potpisani kontrolni dokaz za obiteljski paket".into());
     }
-    for ctrl in cached {
-        if needed.includes(&ctrl, recipient, channels)
+    for (ctrl, is_relayable) in cached {
+        if is_relayable
+            && required_needed.includes(&ctrl, recipient, channels)
             && !raw_proofs.contains(&serde_json::to_string(&ctrl).map_err(|e| e.to_string())?)
         {
             return Err(

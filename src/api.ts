@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
   CartItem,
   LedgerStats,
@@ -223,6 +224,29 @@ export async function saveSyncPackage(json: string, familyOnly: boolean): Promis
   return invoke<string>("save_sync_bundle_file", {jsonStr:json,familyOnly});
 }
 
+export interface SyncIdentity {
+  device_public_key: string;
+  network_public_key: string;
+  principal_id: string;
+}
+
+export async function getSyncIdentity(): Promise<SyncIdentity | null> {
+  if (!isTauri()) return null;
+  return invoke<SyncIdentity>("get_sync_identity");
+}
+
+export async function createSyncRequest(peer: string): Promise<unknown> {
+  return invoke("create_sync_request", { peer });
+}
+
+export async function createSyncReply(request: unknown, maxBytes?: number): Promise<string> {
+  return invoke<string>("create_sync_reply", { request, maxBytes: maxBytes ?? null });
+}
+
+export async function receiveSyncPage(bundleJson: string): Promise<unknown> {
+  return invoke("receive_sync_page", { bundleJson });
+}
+
 export async function getLedgerStats(): Promise<LedgerStats> {
   if (!isTauri()) {
     return {
@@ -274,4 +298,162 @@ export async function addNetworkMember(params: {
 
 export async function removeNetworkMember(peerId: string): Promise<void> {
   return invoke<void>("remove_network_member", { peerId });
+}
+
+export interface PairStatusView {
+  waiting: boolean;
+  pending: boolean;
+  listen_port?: number | null;
+  sas?: string | null;
+  peer_device_id?: string | null;
+  peer_name?: string | null;
+  peer_public_key?: string | null;
+  peer_host?: string | null;
+  error?: string | null;
+  can_admit: boolean;
+}
+
+export interface PairOutcomeView {
+  paired: boolean;
+  member: boolean;
+  admitted: boolean;
+  peer_public_key: string;
+  message: string;
+}
+
+export async function getPairStatus(): Promise<PairStatusView | null> {
+  if (!isTauri()) return null;
+  return invoke<PairStatusView>("get_pair_status");
+}
+
+export async function startPairListening(params?: {
+  port?: number | null;
+  deviceName?: string | null;
+}): Promise<PairStatusView> {
+  return invoke<PairStatusView>("start_pair_listening", {
+    port: params?.port ?? null,
+    deviceName: params?.deviceName ?? null,
+  });
+}
+
+export async function stopPairListening(): Promise<PairStatusView> {
+  return invoke<PairStatusView>("stop_pair_listening");
+}
+
+export async function dialPairPeer(params: {
+  addr: string;
+  deviceName?: string | null;
+}): Promise<PairStatusView> {
+  return invoke<PairStatusView>("dial_pair_peer", {
+    addr: params.addr,
+    deviceName: params.deviceName ?? null,
+  });
+}
+
+export async function confirmPairPeer(params: {
+  approved: boolean;
+  role?: PeerRole | null;
+  sharedLists?: string | null;
+  admit?: boolean | null;
+}): Promise<PairOutcomeView> {
+  return invoke<PairOutcomeView>("confirm_pair_peer", {
+    approved: params.approved,
+    role: params.role ?? null,
+    sharedLists: params.sharedLists ?? null,
+    admit: params.admit ?? null,
+  });
+}
+
+export interface PeerSyncRecord {
+  peer_public_key: string;
+  peer_name: string;
+  last_addr?: string;
+  manual_addr?: string;
+  last_sync_at?: string;
+  last_path?: string;
+  last_applied: number;
+  last_sent: number;
+  last_error?: string;
+}
+
+export interface LanServiceStatus {
+  running: boolean;
+  paused: boolean;
+  exchange_addr: string;
+  discovery_addr?: string;
+  device_public_key: string;
+  active_conversations: number;
+  last_round_at?: string;
+  last_error?: string;
+  peers: PeerSyncRecord[];
+}
+
+export interface FoundLanPeer {
+  protocol: string;
+  deviceId: string;
+  name: string;
+  exchangePort: number;
+  pairPort?: number;
+  meta?: Record<string, string>;
+  addr: string;
+}
+
+export interface SessionOutcome {
+  rounds: number;
+  total_applied_versions: number;
+  total_peer_applied_versions: number;
+  idle: boolean;
+}
+
+export async function getLanStatus(): Promise<LanServiceStatus> {
+  return invoke<LanServiceStatus>("get_lan_status");
+}
+
+export async function startLanSync(): Promise<LanServiceStatus> {
+  return invoke<LanServiceStatus>("start_lan_sync");
+}
+
+export async function stopLanSync(): Promise<LanServiceStatus> {
+  return invoke<LanServiceStatus>("stop_lan_sync");
+}
+
+export async function setLanPaused(paused: boolean): Promise<LanServiceStatus> {
+  return invoke<LanServiceStatus>("set_lan_paused", { paused });
+}
+
+export async function listenLanStatusChanged(
+  handler: (status: LanServiceStatus) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  return listen<LanServiceStatus>("lan-status-changed", (event) => {
+    handler(event.payload);
+  });
+}
+
+export async function discoverLanPeers(): Promise<FoundLanPeer[]> {
+  return invoke<FoundLanPeer[]>("discover_lan_peers");
+}
+
+export async function triggerLanSync(): Promise<number> {
+  return invoke<number>("trigger_lan_sync");
+}
+
+export async function setManualPeerAddr(
+  peerPublicKey: string,
+  addr?: string | null,
+): Promise<void> {
+  return invoke<void>("set_manual_peer_addr", {
+    peerPublicKey,
+    addr: addr ?? null,
+  });
+}
+
+export async function syncLanPeerAt(
+  peerPublicKey: string,
+  addr: string,
+): Promise<SessionOutcome> {
+  return invoke<SessionOutcome>("sync_lan_peer_at", {
+    peerPublicKey,
+    addr,
+  });
 }

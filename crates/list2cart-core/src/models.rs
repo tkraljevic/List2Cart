@@ -210,6 +210,12 @@ pub struct ProductSyncPayload {
     pub last_price_cents: i64,
     pub last_store_name: String,
     pub image_data_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_mime: Option<String>,
+    #[serde(default)]
+    pub image_bytes: usize,
     pub updated_at: String,
     #[serde(default)]
     pub archived: bool,
@@ -288,8 +294,8 @@ pub struct PlannedItemSyncPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "control_kind", content = "data", rename_all = "snake_case")]
 pub enum ControlPayload {
-    Ovlast(list2cart_sync::trust::Ovlast),
-    Membership(list2cart_sync::trust::Membership),
-    ListGrant(list2cart_sync::trust::ListGrant),
-    Revocation(list2cart_sync::trust::Revocation),
+    Ovlast(syncnet::trust::Ovlast),
+    Membership(syncnet::trust::Membership),
+    ListGrant(syncnet::trust::ListGrant),
+    Revocation(syncnet::trust::Revocation),
 }

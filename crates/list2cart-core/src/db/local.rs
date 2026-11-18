@@ -6,11 +6,11 @@ use crate::apply::{
 use crate::ledger::{Version, record_signed_version};
 use crate::models::{ControlPayload, qty_to_millis};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use list2cart_sync::identity::{
+use syncnet::identity::{
     generate_signing_key, load_key, load_or_create_key, parse_public_key, principal_id_from_key,
     verifying_key_to_base64,
 };
-use list2cart_sync::trust::{MemberRole, NetworkKey, Validity};
+use syncnet::trust::{MemberRole, NetworkKey, Validity};
 
 const ID_NAMESPACE: Uuid = Uuid::from_u128(0x6c32632d_6c6f_4361_8c69_64656e746974);
 const ENTITIES: [&str; 7] = [
@@ -31,6 +31,13 @@ pub struct SyncIdentity {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct ActiveSyncPeer {
+    pub device_id: String,
+    pub public_key: [u8; 32],
+    pub public_key_b64: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct IdentityConflict {
     pub entity: String,
     pub value: String,
@@ -42,6 +49,7 @@ pub(super) struct LocalIdentity {
     network_public: VerifyingKey,
     network_key: Option<SigningKey>,
     principal: String,
+    db_path: Option<std::path::PathBuf>,
 }
 
 fn setting(conn: &Connection, name: &str) -> Result<Option<String>, String> {
@@ -76,6 +84,7 @@ impl LocalIdentity {
             network_public: root.verifying_key(),
             principal: principal_id_from_key(root.verifying_key().as_bytes()),
             network_key: Some(root),
+            db_path: None,
         }
     }
 
@@ -121,6 +130,7 @@ impl LocalIdentity {
             network_public,
             network_key,
             principal,
+            db_path: Some(path.to_path_buf()),
         })
     }
 }
@@ -237,6 +247,181 @@ impl Database {
         }
     }
 
+    pub fn clone_device_signing_key(&self) -> SigningKey {
+        self.identity.key.clone()
+    }
+
+    fn pairing_context<'a>(
+        &'a self,
+        network_name: &'a str,
+    ) -> crate::pairing_session::PairingContext<'a> {
+        crate::pairing_session::PairingContext {
+            conn: &self.conn,
+            device_key: &self.identity.key,
+            network_pub: &self.identity.network_public,
+            network_key: self.identity.network_key.as_ref(),
+            principal: &self.identity.principal,
+            network_name,
+        }
+    }
+
+    pub fn can_admit_members(&self) -> Result<bool, String> {
+        let name = self.network_name()?;
+        crate::pairing_session::can_admit(&self.pairing_context(&name))
+    }
+
+    pub fn tls_credentials(&self) -> Result<Option<Vec<u8>>, String> {
+        let name = self.network_name()?;
+        crate::pairing_session::build_tls_credentials(&self.pairing_context(&name))
+    }
+
+    pub fn prepare_welcome_pack(
+        &self,
+        peer_key: &[u8; 32],
+        role: crate::ledger::PeerRole,
+        shared_lists: &str,
+        admit: bool,
+    ) -> Result<crate::pairing_session::WelcomePack, String> {
+        let name = self.network_name()?;
+        crate::pairing_session::prepare_welcome_pack(
+            &self.pairing_context(&name),
+            peer_key,
+            role,
+            shared_lists,
+            admit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_pairing(
+        &mut self,
+        peer_hello: &syncnet::pairing::PairHello,
+        peer_key: &[u8; 32],
+        sas_code: &str,
+        role: crate::ledger::PeerRole,
+        shared_lists: &str,
+        given: Option<&crate::pairing_session::WelcomePack>,
+        received: Option<&crate::pairing_session::WelcomePack>,
+    ) -> Result<crate::pairing_session::PairOutcomeView, String> {
+        let name = self.network_name()?;
+        let (outcome, joined_update) = crate::pairing_session::finalize_pairing_in_db(
+            &self.pairing_context(&name),
+            peer_hello,
+            peer_key,
+            sas_code,
+            role,
+            shared_lists,
+            given,
+            received,
+        )?;
+        if let Some(update) = joined_update {
+            if let Some(ref db_path) = self.identity.db_path {
+                let _ = std::fs::remove_file(key_path(db_path, "network"));
+            }
+            self.identity.network_public = update.network_public;
+            self.identity.network_key = None;
+            self.identity.principal = update.principal;
+        }
+        Ok(outcome)
+    }
+
+    pub fn verify_or_recover_peer_access(
+        &self,
+        peer_key: &[u8; 32],
+        credentials: Option<&[u8]>,
+    ) -> Result<bool, String> {
+        let name = self.network_name()?;
+        crate::pairing_session::verify_or_recover_peer_access(
+            &self.pairing_context(&name),
+            peer_key,
+            credentials,
+        )
+    }
+
+    /// Lists all active non-revoked members in the sync network except the local device itself.
+    pub fn list_active_sync_peers(&self) -> Result<Vec<ActiveSyncPeer>, String> {
+        let own_b64 = verifying_key_to_base64(&self.identity.key.verifying_key());
+        let now = Utc::now().timestamp();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT subject_key FROM sync_trust_records
+                 WHERE kind = 'membership' AND revoked = 0 AND subject_key != ?1",
+            )
+            .map_err(sql_error)?;
+        let rows = stmt
+            .query_map([&own_b64], |r| r.get::<_, String>(0))
+            .map_err(sql_error)?;
+
+        let mut peers = Vec::new();
+        for row in rows {
+            let subject_b64 = row.map_err(sql_error)?;
+            let Ok(vk) = parse_public_key(&subject_b64) else {
+                continue;
+            };
+            let pk_bytes = vk.to_bytes();
+            if self
+                .verify_or_recover_peer_access(&pk_bytes, None)
+                .unwrap_or(false)
+            {
+                let device_id = self
+                    .conn
+                    .query_row(
+                        "SELECT target_id FROM sync_trust_records
+                         WHERE kind = 'membership' AND subject_key = ?1 AND revoked = 0
+                           AND issued_at <= ?2 AND (expires_at = 0 OR expires_at >= ?2)
+                         ORDER BY issued_at DESC LIMIT 1",
+                        params![subject_b64, now],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(sql_error)?
+                    .unwrap_or_else(|| subject_b64.clone());
+                peers.push(ActiveSyncPeer {
+                    device_id,
+                    public_key: pk_bytes,
+                    public_key_b64: subject_b64,
+                });
+            }
+        }
+        Ok(peers)
+    }
+
+    #[must_use]
+    pub fn blobs_dir(&self) -> Option<std::path::PathBuf> {
+        crate::content::blobs_dir_for_db(self.identity.db_path.as_deref())
+    }
+
+    pub fn pending_content_wants(&self, limit: usize) -> Result<Vec<String>, String> {
+        crate::content::pending_wants(&self.conn, limit)
+    }
+
+    pub fn fulfill_content_wants(
+        &self,
+        peer_key: &[u8; 32],
+        requested_hashes: &[String],
+    ) -> Result<Vec<syncnet::wire::conversation::ContentBlobItem>, String> {
+        crate::content::fulfill_wants_for_peer(
+            &self.conn,
+            self.blobs_dir().as_deref(),
+            &self.identity.network_public,
+            peer_key,
+            requested_hashes,
+            Utc::now().timestamp(),
+        )
+    }
+
+    pub fn receive_wanted_content(
+        &self,
+        items: &[syncnet::wire::conversation::ContentBlobItem],
+    ) -> Result<crate::content::ContentReceiveReport, String> {
+        crate::content::receive_wanted_content(&self.conn, self.blobs_dir().as_deref(), items)
+    }
+
+    pub fn gc_unreferenced_content(&self) -> Result<crate::content::ContentGcReport, String> {
+        crate::content::gc_unreferenced_content(&self.conn, self.blobs_dir().as_deref())
+    }
+
     /// Encrypts a delta for one admitted recipient using this database's device key.
     pub fn export_protected_bundle(
         &self,
@@ -244,7 +429,7 @@ impl Database {
         frontier: &BTreeMap<String, String>,
         holes: &[crate::ledger::HoleRecord],
         max_bytes: usize,
-    ) -> Result<list2cart_sync::wire::bundle_v2::ProtectedBundleV2, String> {
+    ) -> Result<syncnet::wire::bundle_v2::ProtectedBundleV2, String> {
         let recipient = parse_public_key(recipient_public_key).map_err(|e| e.to_string())?;
         crate::apply::export_protected_bundle_for_recipient(
             &self.conn,
@@ -264,7 +449,7 @@ impl Database {
     /// Opens and admits a protected package without exposing private key material.
     pub fn import_protected_bundle(
         &self,
-        bundle: &list2cart_sync::wire::bundle_v2::ProtectedBundleV2,
+        bundle: &syncnet::wire::bundle_v2::ProtectedBundleV2,
     ) -> Result<crate::apply::ApplyReport, String> {
         crate::apply::import_protected_bundle(
             &self.conn,
@@ -296,13 +481,13 @@ impl Database {
         &self,
         request: &crate::exchange::SyncRequest,
         max_bytes: usize,
-    ) -> Result<list2cart_sync::wire::bundle_v2::ProtectedBundleV2, String> {
+    ) -> Result<syncnet::wire::bundle_v2::ProtectedBundleV2, String> {
         crate::exchange::reply(self.recovery_context(), request, max_bytes)
     }
 
     pub fn import_sync_page(
         &self,
-        bundle: &list2cart_sync::wire::bundle_v2::ProtectedBundleV2,
+        bundle: &syncnet::wire::bundle_v2::ProtectedBundleV2,
     ) -> Result<crate::exchange::SyncReceiveOutcome, String> {
         crate::exchange::receive(self.recovery_context(), bundle)
     }
@@ -328,7 +513,7 @@ impl Database {
         recipient: &str,
         offset: usize,
         max_bytes: usize,
-    ) -> Result<list2cart_sync::wire::bundle_v2::ProtectedBundleV2, String> {
+    ) -> Result<syncnet::wire::bundle_v2::ProtectedBundleV2, String> {
         crate::recovery::export_page(
             self.recovery_context(),
             snapshot_id,
@@ -340,7 +525,7 @@ impl Database {
 
     pub fn import_snapshot_page(
         &self,
-        bundle: &list2cart_sync::wire::bundle_v2::ProtectedBundleV2,
+        bundle: &syncnet::wire::bundle_v2::ProtectedBundleV2,
     ) -> Result<crate::recovery::SnapshotProgress, String> {
         crate::recovery::import_page(self.recovery_context(), bundle)
     }
@@ -361,6 +546,76 @@ impl Database {
         outgoing: bool,
     ) -> Result<(), String> {
         crate::recovery::discard(&self.conn, snapshot_id, peer, outgoing)
+    }
+
+    /// Admits an encrypted/signed v2 package (delta or snapshot page) or falls
+    /// back to explicit local legacy v1 snapshot import. Unknown versions are rejected.
+    pub fn import_sync_package_json(
+        &self,
+        json_str: &str,
+    ) -> Result<(usize, usize, usize), String> {
+        let value: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| format!("Neispravna .list2cart datoteka: {e}"))?;
+        if let Some(format_version) = value.get("format_version") {
+            if format_version.as_u64() != Some(2) {
+                return Err("Nepodržana inačica zaštićenog paketa".into());
+            }
+            let bundle: syncnet::wire::bundle_v2::ProtectedBundleV2 = serde_json::from_value(value)
+                .map_err(|e| format!("Neispravan zaštićeni v2 paket: {e}"))?;
+            let before_stores = self.list_stores()?.len();
+            let before_products = self.list_products(None)?.len();
+            let before_lists = self.list_shopping_lists()?.len();
+            match self.import_sync_page(&bundle)? {
+                crate::exchange::SyncReceiveOutcome::Delta { report, .. } => {
+                    if report.applied_versions == 0 && !report.rejected.is_empty() {
+                        return Err(format!(
+                            "Zaštićeni paket je odbijen: {}",
+                            report.rejected[0].reason
+                        ));
+                    }
+                    let mut stores = 0usize;
+                    let mut products = 0usize;
+                    let mut lists = 0usize;
+                    for vid in &report.applied_ids {
+                        let entity: Option<String> = self
+                            .conn
+                            .query_row(
+                                "SELECT entity FROM record_versions WHERE version_id=?1",
+                                [vid],
+                                |r| r.get(0),
+                            )
+                            .optional()
+                            .map_err(sql_error)?;
+                        match entity.as_deref() {
+                            Some("stores") => stores += 1,
+                            Some("products") => products += 1,
+                            Some("shopping_lists" | "planned_items") => lists += 1,
+                            _ => {}
+                        }
+                    }
+                    Ok((stores, products, lists))
+                }
+                crate::exchange::SyncReceiveOutcome::Snapshot { progress } => {
+                    if !progress.complete {
+                        return Ok((0, 0, 0));
+                    }
+                    let after_stores = self.list_stores()?.len().saturating_sub(before_stores);
+                    let after_products = self
+                        .list_products(None)?
+                        .len()
+                        .saturating_sub(before_products);
+                    let after_lists = self
+                        .list_shopping_lists()?
+                        .len()
+                        .saturating_sub(before_lists);
+                    Ok((after_stores, after_products, after_lists))
+                }
+            }
+        } else {
+            let bundle: SyncBundle = serde_json::from_value(value)
+                .map_err(|e| format!("Neispravna .list2cart datoteka: {e}"))?;
+            self.import_sync_bundle(&bundle)
+        }
     }
 
     pub(super) fn initialize_local_identity(&self) -> Result<(), String> {
@@ -551,11 +806,51 @@ impl Database {
             stable_id(&self.identity.principal, "product", input.barcode.trim())
         });
         let now = Utc::now().to_rfc3339();
-        tx.execute("INSERT INTO products(barcode,sync_id,name,category,default_unit,last_price_cents,last_store_name,image_data_url,updated_at)
-              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(sync_id) DO UPDATE SET name=excluded.name,category=excluded.category,
-            default_unit=excluded.default_unit,last_price_cents=excluded.last_price_cents,last_store_name=excluded.last_store_name,
-            image_data_url=COALESCE(excluded.image_data_url,products.image_data_url),updated_at=excluded.updated_at",
-            params![input.barcode.trim(),id,input.name.trim(),input.category.trim(),input.default_unit.as_str(),input.price_cents,input.store_name.trim(),input.image_data_url,now]).map_err(sql_error)?;
+        let new_image_hash = match input
+            .image_data_url
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw_url) => {
+                let (mime, bytes) = crate::content::parse_image_data_url(raw_url)?;
+                let channel = format!("private:{}", self.identity.principal);
+                crate::content::store_verified_blob(
+                    tx,
+                    self.blobs_dir().as_deref(),
+                    None,
+                    &mime,
+                    &bytes,
+                    "local",
+                    Some(("products", &id, &channel)),
+                )?
+            }
+            None => String::new(),
+        };
+        tx.execute(
+            "INSERT INTO products(barcode,sync_id,name,category,default_unit,last_price_cents,last_store_name,image_data_url,image_hash,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,?8,?9)
+             ON CONFLICT(sync_id) DO UPDATE SET
+                name=excluded.name,
+                category=excluded.category,
+                default_unit=excluded.default_unit,
+                last_price_cents=excluded.last_price_cents,
+                last_store_name=excluded.last_store_name,
+                image_data_url=CASE WHEN excluded.image_hash != '' THEN NULL ELSE products.image_data_url END,
+                image_hash=CASE WHEN excluded.image_hash != '' THEN excluded.image_hash ELSE products.image_hash END,
+                updated_at=excluded.updated_at",
+            params![
+                input.barcode.trim(),
+                id,
+                input.name.trim(),
+                input.category.trim(),
+                input.default_unit.as_str(),
+                input.price_cents,
+                input.store_name.trim(),
+                new_image_hash,
+                now
+            ],
+        )
+        .map_err(sql_error)?;
         self.record_snapshot(tx, "products", &id)?;
         if input.price_cents > 0 && !input.store_name.trim().is_empty() {
             let price_id = Uuid::new_v4().to_string();
@@ -968,6 +1263,14 @@ fn string_rows(conn: &Connection, sql: &str) -> Result<Vec<String>, String> {
         .map_err(sql_error)
 }
 
+pub(crate) fn local_snapshot_for_pairing(
+    conn: &Connection,
+    entity: &str,
+    id: &str,
+) -> Result<(String, bool), String> {
+    snapshot(conn, entity, id)
+}
+
 fn snapshot(conn: &Connection, entity: &str, id: &str) -> Result<(String, bool), String> {
     // SQLite JSON emits bools explicitly; integer millis and cents have a stable wire representation.
     let sql = match entity {
@@ -975,7 +1278,7 @@ fn snapshot(conn: &Connection, entity: &str, id: &str) -> Result<(String, bool),
             "SELECT json_object('sync_id',sync_id,'name',name,'location',location,'color',color,'updated_at',updated_at,'archived',json(CASE archived WHEN 0 THEN 'false' ELSE 'true' END)),archived FROM stores WHERE sync_id=?1"
         }
         "products" => {
-            "SELECT json_object('sync_id',sync_id,'barcode',barcode,'name',name,'category',category,'default_unit',default_unit,'last_price_cents',last_price_cents,'last_store_name',last_store_name,'image_data_url',image_data_url,'updated_at',updated_at,'archived',json(CASE archived WHEN 0 THEN 'false' ELSE 'true' END)),archived FROM products WHERE sync_id=?1"
+            "SELECT json_object('sync_id',p.sync_id,'barcode',p.barcode,'name',p.name,'category',p.category,'default_unit',p.default_unit,'last_price_cents',p.last_price_cents,'last_store_name',p.last_store_name,'image_data_url',NULL,'image_hash',NULLIF(p.image_hash,''),'image_mime',(SELECT b.mime FROM content_blobs b WHERE b.hash=p.image_hash),'image_bytes',COALESCE((SELECT b.size_bytes FROM content_blobs b WHERE b.hash=p.image_hash),0),'updated_at',p.updated_at,'archived',json(CASE p.archived WHEN 0 THEN 'false' ELSE 'true' END)),p.archived FROM products p WHERE p.sync_id=?1"
         }
         "price_history" => {
             "SELECT json_object('sync_id',ph.sync_id,'barcode',ph.barcode,'product_sync_id',p.sync_id,'store_sync_id',COALESCE(s.sync_id,''),'store_name',ph.store_name,'price_cents',ph.price_cents,'recorded_at',ph.recorded_at,'updated_at',CASE ph.updated_at WHEN '' THEN ph.recorded_at ELSE ph.updated_at END,'archived',json(CASE ph.archived WHEN 0 THEN 'false' ELSE 'true' END)),ph.archived FROM price_history ph JOIN products p ON p.barcode=ph.barcode LEFT JOIN stores s ON s.name=ph.store_name WHERE ph.sync_id=?1"

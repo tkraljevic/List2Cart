@@ -1,16 +1,14 @@
 //! Conservative family dispatcher: immutable snapshots on changes, tiny idle replies.
 use crate::apply::{PROTOCOL_NAME, ProtectedSyncPayload};
 use crate::exchange::SyncRequest;
-use crate::ledger::{
-    DeltaBatch, get_confirmed_frontier, get_frontier, list_holes, split_frontier_key,
-};
+use crate::ledger::{DeltaBatch, get_confirmed_frontier, list_holes, split_frontier_key};
 use crate::recovery::{self, RecoveryContext};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::Signer;
-use list2cart_sync::identity::{parse_public_key, public_key_to_base64};
-use list2cart_sync::wire::bundle_v2::ProtectedBundleV2;
 use rusqlite::{OptionalExtension, params};
 use std::collections::BTreeMap;
+use syncnet::identity::{parse_public_key, public_key_to_base64};
+use syncnet::wire::bundle_v2::ProtectedBundleV2;
 use uuid::Uuid;
 
 pub(crate) fn request(ctx: RecoveryContext<'_>, peer: &str) -> Result<SyncRequest, String> {
@@ -68,9 +66,11 @@ pub(crate) fn reply(
     let channels = recovery::family_scope(&ctx, peer)?;
     let proofs = crate::family::proofs(
         ctx.conn,
+        ctx.network,
         peer,
         &public_key_to_base64(ctx.network.as_bytes()),
         &channels,
+        ctx.now,
     )?;
     let proof_hash = Some(recovery::hash_versions(&proofs)?.0);
     let matches = |m: &recovery::SnapshotManifest| {
@@ -98,13 +98,19 @@ pub(crate) fn reply(
             tx.commit().map_err(|e| e.to_string())?;
             confirmed = matches(&manifest);
         } else if !complete && matches(&manifest) {
-            return recovery::export_page(
+            match recovery::export_page(
                 ctx,
                 &progress.snapshot_id,
                 peer,
                 progress.next_offset,
                 budget,
-            );
+            ) {
+                Ok(bundle) => return Ok(bundle),
+                Err(err) if err.contains("ovlasti su promijenjene") => {
+                    recovery::discard(ctx.conn, &progress.snapshot_id, peer, true)?;
+                }
+                Err(err) => return Err(err),
+            }
         } else if !complete {
             recovery::discard(ctx.conn, &progress.snapshot_id, peer, true)?;
         }
@@ -120,7 +126,14 @@ pub(crate) fn reply(
         let (manifest, _, _) =
             recovery::load_session(ctx.conn, "out", &id, peer)?.ok_or("Nedostaje snapshot")?;
         if matches(&manifest) {
-            return recovery::export_page(ctx, &id, peer, 0, budget);
+            match recovery::export_page(ctx, &id, peer, 0, budget) {
+                Ok(bundle) => return Ok(bundle),
+                Err(err) if err.contains("ovlasti su promijenjene") => {
+                    recovery::discard(ctx.conn, &id, peer, true)?;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
         }
         recovery::discard(ctx.conn, &id, peer, true)?;
     }
@@ -129,14 +142,31 @@ pub(crate) fn reply(
         .filter(|ch| ch.as_str() != "control")
         .cloned()
         .collect();
-    let newer = get_frontier(ctx.conn)?.iter().any(|(key, value)| {
-        domains.contains(split_frontier_key(key).1)
-            && request.frontier.get(key).is_none_or(|old| value > old)
-    });
+    let relayable =
+        crate::apply::relayable_domain_versions(ctx.conn, ctx.network, &domains, ctx.now)?;
+    let mut relayable_frontier = BTreeMap::<String, String>::new();
+    for v in &relayable {
+        let key = crate::ledger::frontier_key(&v.node_id, &v.channel);
+        relayable_frontier
+            .entry(key)
+            .and_modify(|max| *max = max.clone().max(v.version_id.clone()))
+            .or_insert_with(|| v.version_id.clone());
+    }
+    let relayable_ids: std::collections::BTreeSet<String> =
+        relayable.into_iter().map(|v| v.version_id).collect();
+    let newer = relayable_frontier
+        .iter()
+        .any(|(key, value)| request.frontier.get(key).is_none_or(|old| value > old));
     if !confirmed
         || newer
-        || !crate::ledger::recovery_keys(ctx.conn, &request.frontier, &request.holes, &domains)?
-            .is_empty()
+        || !crate::ledger::recovery_keys_filtered(
+            ctx.conn,
+            &request.frontier,
+            &request.holes,
+            &domains,
+            Some(&relayable_ids),
+        )?
+        .is_empty()
         || crate::backfill::needs_recovery(ctx.conn, &domains, &request.backfill_revisions)?
     {
         let manifest = recovery::start_family(ctx, peer)?;

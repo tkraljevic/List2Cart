@@ -2,7 +2,7 @@ use super::*;
 use crate::apply::allowed_channels_for_recipient;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::Signer;
-use list2cart_sync::trust::{ListGrant, Membership, Revocation};
+use syncnet::trust::{ListGrant, Membership, Revocation};
 
 pub(super) fn member(f: &Fixture, key: &SigningKey, issued: i64) -> ControlPayload {
     ControlPayload::Membership(
@@ -1042,7 +1042,7 @@ fn unknown_legacy_revocation_stays_fail_closed_during_scope_migration() {
         ],
     )
     .unwrap();
-    conn.execute_batch("DELETE FROM schema_migrations WHERE version=6")
+    conn.execute_batch("DELETE FROM schema_migrations WHERE version>=6")
         .unwrap();
     crate::migrations::run_migrations(conn).unwrap();
     let scope: String = conn
@@ -1080,7 +1080,7 @@ fn scope_migration_repairs_only_the_grant_scope_and_rolls_back_on_failure() {
         [&public],
     )
     .unwrap();
-    conn.execute_batch("UPDATE sync_trust_records SET permission='' WHERE kind='revocation'; DELETE FROM schema_migrations WHERE version=6; CREATE TEMP TRIGGER fail_acl_migration BEFORE UPDATE ON sync_trust_records WHEN NEW.kind='membership' BEGIN SELECT RAISE(ABORT,'injected migration failure'); END;").unwrap();
+    conn.execute_batch("UPDATE sync_trust_records SET permission='' WHERE kind='revocation'; DELETE FROM schema_migrations WHERE version>=6; CREATE TEMP TRIGGER fail_acl_migration BEFORE UPDATE ON sync_trust_records WHEN NEW.kind='membership' BEGIN SELECT RAISE(ABORT,'injected migration failure'); END;").unwrap();
     assert!(crate::migrations::run_migrations(conn).is_err());
     let scope: String = conn
         .query_row(

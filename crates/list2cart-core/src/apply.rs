@@ -1,7 +1,7 @@
 use crate::calc::{MAX_SAFE_CENTS, checked_line_total_millis};
 use crate::ledger::{
-    DeltaBatch, HoleRecord, Version, compute_delta_paged, get_confirmed_frontier, narrow_holes,
-    record_hole, record_rejected_range, update_peer_ack,
+    DeltaBatch, HoleRecord, Version, compute_delta_paged_filtered, get_confirmed_frontier,
+    narrow_holes, record_hole, record_rejected_range, update_peer_ack,
 };
 use crate::models::{
     ControlPayload, PlannedItemSyncPayload, PriceHistorySyncPayload, ProductSyncPayload,
@@ -9,14 +9,12 @@ use crate::models::{
     millis_to_qty,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use list2cart_sync::identity::{parse_public_key, public_key_to_base64};
-use list2cart_sync::trust::{
-    ListPermission, MAX_CLOCK_SKEW_SECS, MemberRole, SignedVersionEnvelope,
-};
-use list2cart_sync::wire::bundle_v2::ProtectedBundleV2;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use syncnet::identity::{parse_public_key, public_key_to_base64};
+use syncnet::trust::{ListPermission, MAX_CLOCK_SKEW_SECS, MemberRole, SignedVersionEnvelope};
+pub use syncnet::wire::bundle_v2::ProtectedBundleV2;
 use uuid::Uuid;
 
 pub const PROTOCOL_NAME: &str = "list2cart";
@@ -272,6 +270,313 @@ fn store_control_record_inner(
         }
     }
     Ok(())
+}
+
+pub(crate) fn control_payload_is_relayable(
+    conn: &Connection,
+    network_pub: &VerifyingKey,
+    ctrl: &ControlPayload,
+    now_unix: i64,
+) -> Result<(), String> {
+    let raw = serde_json::to_string(ctrl).map_err(|e| format!("JSON greska: {e}"))?;
+    match ctrl {
+        ControlPayload::Ovlast(o) => {
+            if o.issued_at > now_unix {
+                return Err("Ovlast još nije važeća".into());
+            }
+            o.verify(network_pub, o.issued_at)
+                .map_err(|e| format!("Neispravna ovlast: {e}"))?;
+            crate::acl::may_store(
+                conn,
+                crate::acl::ControlIdentity {
+                    id: &format!("ovlast:{}", o.device_key),
+                    kind: "ovlast",
+                    subject: &o.device_key,
+                    target: &o.device_id,
+                    issued: o.issued_at,
+                    raw: &raw,
+                },
+            )?;
+        }
+        ControlPayload::Membership(m) => {
+            if m.issued_at > now_unix {
+                return Err("Članstvo još nije važeće".into());
+            }
+            let member_vk = parse_public_key(&m.device_key)
+                .map_err(|e| format!("Neispravan kljuc clanstva: {e}"))?;
+            m.verify(network_pub, &member_vk, m.issued_at)
+                .map_err(|e| format!("Neispravno clanstvo: {e}"))?;
+            crate::acl::check_delegation_at(conn, network_pub, m.admitter.as_ref(), m.issued_at)?;
+            crate::acl::may_store(
+                conn,
+                crate::acl::ControlIdentity {
+                    id: &format!("membership:{}", m.device_key),
+                    kind: "membership",
+                    subject: &m.device_key,
+                    target: &m.principal_id,
+                    issued: m.issued_at,
+                    raw: &raw,
+                },
+            )?;
+        }
+        ControlPayload::ListGrant(g) => {
+            if g.issued_at > now_unix {
+                return Err("Grant još nije važeći".into());
+            }
+            let rec_vk = parse_public_key(&g.recipient_pub_key)
+                .map_err(|e| format!("Neispravan kljuc granta: {e}"))?;
+            g.verify(network_pub, &rec_vk, g.issued_at)
+                .map_err(|e| format!("Neispravan grant popisa: {e}"))?;
+            crate::acl::check_delegation_at(conn, network_pub, g.admitter.as_ref(), g.issued_at)?;
+            crate::acl::may_store(
+                conn,
+                crate::acl::ControlIdentity {
+                    id: &g.grant_id,
+                    kind: "list_grant",
+                    subject: &g.recipient_pub_key,
+                    target: &g.list_sync_id,
+                    issued: g.issued_at,
+                    raw: &raw,
+                },
+            )?;
+        }
+        ControlPayload::Revocation(r) => {
+            let signer = r
+                .verify_self()
+                .map_err(|e| format!("Neispravan potpis opoziva: {e}"))?;
+            let signer_b64 = public_key_to_base64(signer.as_bytes());
+            let network_b64 = public_key_to_base64(network_pub.as_bytes());
+            if signer_b64 != network_b64
+                && !crate::acl::historical_admin(conn, network_pub, &signer_b64, r.issued_at)?
+            {
+                return Err("Potpisnik opoziva nema ovlast na mrezi".to_owned());
+            }
+            let scope = r.scope().map_err(|e| e.to_string())?;
+            if r.public_key == network_b64 && scope != "list_grant" {
+                return Err(
+                    "Korijenski ključ mreže nije članstvo ni delegirana ovlast uređaja".into(),
+                );
+            }
+            if r.issued_at > now_unix || r.revoked_at > now_unix {
+                return Err("Opoziv još nije važeći".into());
+            }
+            if scope == "list_grant" {
+                let existing: Option<(String, String)> = conn
+                    .query_row(
+                        "SELECT kind,subject_key FROM sync_trust_records WHERE record_id=?1",
+                        [&r.target_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                if existing.is_some_and(|(kind, key)| kind != "list_grant" || key != r.public_key) {
+                    return Err("Opoziv granta ne odgovara ključu i cilju ovlasti".into());
+                }
+            }
+            crate::acl::may_store(
+                conn,
+                crate::acl::ControlIdentity {
+                    id: &r.id,
+                    kind: "revocation",
+                    subject: &r.public_key,
+                    target: &r.target_id,
+                    issued: r.issued_at,
+                    raw: &raw,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn control_version_is_relayable(
+    conn: &Connection,
+    network_pub: &VerifyingKey,
+    v: &Version,
+    now_unix: i64,
+) -> Result<ControlPayload, String> {
+    let ctrl = verify_control_version_envelope(v, network_pub, conn, now_unix)?;
+    control_payload_is_relayable(conn, network_pub, &ctrl, now_unix)?;
+    Ok(ctrl)
+}
+
+pub(crate) fn relayable_control_versions(
+    conn: &Connection,
+    network_pub: &VerifyingKey,
+    now_unix: i64,
+) -> Result<Vec<Version>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT version_id,entity,entity_id,node_id,supersedes,archived,payload,created_at,schema_version,channel,author_pub_key,grant_ref,signature,created_at_unix
+             FROM record_versions WHERE channel='control' AND signature!='' AND legacy_imported=0 ORDER BY version_id ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], crate::ledger::read_version_row)
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<Version>, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut candidates = Vec::new();
+    let mut immutable_ids = BTreeMap::<String, BTreeSet<String>>::new();
+    for v in rows {
+        if let Ok(ctrl) = control_version_is_relayable(conn, network_pub, &v, now_unix) {
+            let raw = serde_json::to_string(&ctrl).map_err(|e| e.to_string())?;
+            let immutable_id = match &ctrl {
+                ControlPayload::ListGrant(g) => Some(g.grant_id.clone()),
+                ControlPayload::Revocation(r) => Some(r.id.clone()),
+                _ => None,
+            };
+            if let Some(id) = immutable_id.clone() {
+                immutable_ids.entry(id).or_default().insert(raw.clone());
+            }
+            candidates.push((v, immutable_id));
+        }
+    }
+    Ok(candidates
+        .into_iter()
+        .filter_map(|(v, immutable_id)| {
+            if let Some(id) = immutable_id
+                && immutable_ids.get(&id).is_some_and(|set| set.len() > 1)
+            {
+                return None;
+            }
+            Some(v)
+        })
+        .collect())
+}
+
+pub(crate) fn relayable_domain_versions(
+    conn: &Connection,
+    network_pub: &VerifyingKey,
+    channels: &BTreeSet<String>,
+    now_unix: i64,
+) -> Result<Vec<Version>, String> {
+    let net_b64 = public_key_to_base64(network_pub.as_bytes());
+    let relayable_controls = relayable_control_versions(conn, network_pub, now_unix)?;
+    let mut relayable_members = BTreeSet::new();
+    let mut relayable_grants = BTreeSet::new();
+    for cv in &relayable_controls {
+        if let Ok(ctrl) = serde_json::from_str::<ControlPayload>(&cv.payload) {
+            match ctrl {
+                ControlPayload::Membership(m) => {
+                    relayable_members.insert(m.device_key);
+                }
+                ControlPayload::ListGrant(g) => {
+                    relayable_grants.insert(g.grant_id);
+                }
+                _ => {}
+            }
+        }
+    }
+    let has_any_control_versions: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM record_versions WHERE channel='control' AND signature!='' AND legacy_imported=0)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT version_id,entity,entity_id,node_id,supersedes,archived,payload,created_at,schema_version,channel,author_pub_key,grant_ref,signature,created_at_unix
+             FROM record_versions
+             WHERE channel!='control' AND signature!='' AND legacy_imported=0
+               AND version_id NOT IN (SELECT version_id FROM pending_projections)
+             ORDER BY version_id ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], crate::ledger::read_version_row)
+        .map_err(|e| e.to_string())?;
+    let mut verified = Vec::new();
+    for row in rows {
+        let v = row.map_err(|e| e.to_string())?;
+        if !channels.contains(&v.channel) {
+            continue;
+        }
+        if has_any_control_versions && v.author_pub_key != net_b64 {
+            let member_in_ledger: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM record_versions WHERE channel='control' AND signature!='' AND legacy_imported=0 AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.control_kind')='membership' AND json_extract(payload,'$.data.deviceKey')=?1 ELSE 0 END)",
+                    [&v.author_pub_key],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if member_in_ledger && !relayable_members.contains(&v.author_pub_key) {
+                continue;
+            }
+            if v.channel.starts_with("list:") {
+                let grant_in_ledger: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM record_versions WHERE channel='control' AND signature!='' AND legacy_imported=0 AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.control_kind')='list_grant' AND json_extract(payload,'$.data.grantId')=?1 ELSE 0 END)",
+                        [&v.grant_ref],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                if grant_in_ledger && !relayable_grants.contains(&v.grant_ref) {
+                    continue;
+                }
+            }
+        }
+        let different_channel: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM record_versions WHERE entity=?1 AND entity_id=?2 AND channel!=?3 AND signature!='')",
+                params![v.entity, v.entity_id, v.channel],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if different_channel
+            || verify_domain_version_auth(conn, network_pub, &v, now_unix).is_err()
+            || validate_payload_syntax_only(&v).is_err()
+            || validate_identity_binding(conn, &v).is_err()
+        {
+            continue;
+        }
+        verified.push(v);
+    }
+    let mut valid_stores = BTreeSet::new();
+    let mut valid_products = BTreeSet::new();
+    let mut valid_lists = BTreeSet::new();
+    for v in &verified {
+        match v.entity.as_str() {
+            "stores" => {
+                valid_stores.insert(v.entity_id.clone());
+            }
+            "products" => {
+                if let Ok(p) = serde_json::from_str::<ProductSyncPayload>(&v.payload) {
+                    valid_products.insert((p.sync_id, p.barcode.trim().to_owned()));
+                }
+            }
+            "shopping_lists" => {
+                valid_lists.insert(v.entity_id.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut valid_receipts = BTreeSet::new();
+    for v in &verified {
+        if v.entity == "receipts"
+            && let Ok(p) = serde_json::from_str::<ReceiptSyncPayload>(&v.payload)
+            && valid_stores.contains(&p.store_sync_id)
+        {
+            valid_receipts.insert(v.entity_id.clone());
+        }
+    }
+    Ok(verified
+        .into_iter()
+        .filter(|v| match v.entity.as_str() {
+            "stores" | "products" | "shopping_lists" => true,
+            "planned_items" => serde_json::from_str::<PlannedItemSyncPayload>(&v.payload)
+                .is_ok_and(|p| valid_lists.contains(&p.list_sync_id)),
+            "price_history" => serde_json::from_str::<PriceHistorySyncPayload>(&v.payload)
+                .is_ok_and(|p| {
+                    valid_products.contains(&(p.product_sync_id, p.barcode.trim().to_owned()))
+                }),
+            "receipts" => valid_receipts.contains(&v.entity_id),
+            "receipt_items" => serde_json::from_str::<ReceiptItemSyncPayload>(&v.payload)
+                .is_ok_and(|p| valid_receipts.contains(&p.receipt_sync_id)),
+            _ => false,
+        })
+        .collect())
 }
 
 fn verify_control_version_envelope(
@@ -563,16 +868,56 @@ fn validate_and_project_entity(conn: &Connection, v: &Version) -> Result<bool, S
             {
                 return Err("Neispravna polja ili cijena artikla".to_owned());
             }
+            let mut resolved_hash = String::new();
+            let mut resolved_inline = None;
+            if let Some(hash) = p
+                .image_hash
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let mime = p.image_mime.as_deref().unwrap_or("");
+                crate::content::record_content_ref_and_want(
+                    conn,
+                    hash,
+                    mime,
+                    p.image_bytes,
+                    "products",
+                    &p.sync_id,
+                    &v.channel,
+                )?;
+                resolved_hash = hash.to_owned();
+            } else if let Some(raw_url) = p
+                .image_data_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if let Ok((mime, bytes)) = crate::content::parse_image_data_url(raw_url) {
+                    resolved_hash = crate::content::store_verified_blob(
+                        conn,
+                        None,
+                        None,
+                        &mime,
+                        &bytes,
+                        "peer",
+                        Some(("products", &p.sync_id, &v.channel)),
+                    )?;
+                } else {
+                    resolved_inline = Some(raw_url.to_owned());
+                }
+            }
             conn.execute(
-                "INSERT INTO products (barcode, sync_id, name, category, default_unit, last_price_cents, last_store_name, image_data_url, updated_at, archived)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "INSERT INTO products (barcode, sync_id, name, category, default_unit, last_price_cents, last_store_name, image_data_url, image_hash, updated_at, archived)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                    ON CONFLICT(sync_id) DO UPDATE SET
                     name = excluded.name,
                     category = excluded.category,
                     default_unit = excluded.default_unit,
                     last_price_cents = excluded.last_price_cents,
                     last_store_name = excluded.last_store_name,
-                    image_data_url = COALESCE(excluded.image_data_url, products.image_data_url),
+                    image_data_url = CASE WHEN excluded.image_hash != '' THEN NULL ELSE COALESCE(excluded.image_data_url, products.image_data_url) END,
+                    image_hash = CASE WHEN excluded.image_hash != '' THEN excluded.image_hash ELSE products.image_hash END,
                     updated_at = excluded.updated_at,
                     archived = excluded.archived",
                 params![
@@ -583,7 +928,8 @@ fn validate_and_project_entity(conn: &Connection, v: &Version) -> Result<bool, S
                     p.default_unit.as_str(),
                     p.last_price_cents,
                     p.last_store_name.trim(),
-                    p.image_data_url,
+                    resolved_inline,
+                    resolved_hash,
                     p.updated_at,
                     i32::from(v.archived || p.archived)
                 ],
@@ -1012,11 +1358,21 @@ pub(crate) fn apply_remote_versions_in_transaction(
         versions.iter().filter(|v| v.channel != "control").collect();
 
     // Authority proofs precede their delegated envelopes even when a relay
-    // published the authority's wrapper later. All revocations still precede data.
+    // published the authority's wrapper later. Revocations of authority or
+    // device keys precede delegated revocations and certificates, and all
+    // control records precede domain data.
+    let net_b64 = public_key_to_base64(network_pub.as_bytes());
     let control_rank = |v: &Version| match serde_json::from_str::<ControlPayload>(&v.payload) {
         Ok(ControlPayload::Ovlast(_)) => 0,
+        Ok(ControlPayload::Revocation(r))
+            if r.scope() == Ok("ovlast")
+                || r.signer_key == net_b64
+                || v.author_pub_key == net_b64 =>
+        {
+            1
+        }
         Ok(ControlPayload::Revocation(_)) => 2,
-        _ => 1,
+        _ => 3,
     };
     control_versions.sort_by(|a, b| {
         control_rank(a)
@@ -1272,17 +1628,26 @@ pub(crate) fn apply_remote_versions_in_transaction(
         if uuid::Uuid::parse_str(&rejected.version_id)
             .is_ok_and(|id| id.get_version_num() == 7 && id.to_string() == rejected.version_id)
         {
-            let previous: String = tx.query_row(
-                "SELECT COALESCE(MAX(version_id), '') FROM record_versions WHERE node_id=?1 AND channel=?2 AND version_id<?3",
-                params![rejected.author_node_id, rejected.channel, rejected.version_id], |r| r.get(0),
-            ).map_err(|e| format!("Greska granice odbijene verzije: {e}"))?;
-            record_hole(
-                tx,
-                &rejected.author_node_id,
-                &rejected.channel,
-                &previous,
-                &rejected.version_id,
-            )?;
+            let has_higher: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM record_versions WHERE node_id=?1 AND channel=?2 AND version_id>?3 AND signature!='' AND legacy_imported=0)",
+                    params![rejected.author_node_id, rejected.channel, rejected.version_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("Greska granice odbijene verzije: {e}"))?;
+            if has_higher {
+                let previous: String = tx.query_row(
+                    "SELECT COALESCE(MAX(version_id), '') FROM record_versions WHERE node_id=?1 AND channel=?2 AND version_id<?3",
+                    params![rejected.author_node_id, rejected.channel, rejected.version_id], |r| r.get(0),
+                ).map_err(|e| format!("Greska granice odbijene verzije: {e}"))?;
+                record_hole(
+                    tx,
+                    &rejected.author_node_id,
+                    &rejected.channel,
+                    &previous,
+                    &rejected.version_id,
+                )?;
+            }
         }
     }
 
@@ -1564,7 +1929,7 @@ pub fn allowed_channels_for_recipient(
     let membership: Option<(String, String)> = if is_owner_root {
         Some((
             "own_device".to_owned(),
-            list2cart_sync::identity::principal_id_from_key(network_pub.as_bytes()),
+            syncnet::identity::principal_id_from_key(network_pub.as_bytes()),
         ))
     } else {
         if cached_membership_blocked {
@@ -1691,17 +2056,39 @@ fn export_protected_bundle_in_snapshot(
         .iter()
         .any(|channel| channel.starts_with("private:") && sender_allowed.contains(channel));
     let batch = if recipient_b64 == public_key_to_base64(network_pub.as_bytes()) || same_principal {
-        compute_delta_paged(conn, peer_frontier, requested_holes, &allowed, batch_budget)?
+        let mut relayable_ids: BTreeSet<String> = if allowed.contains("control") {
+            relayable_control_versions(conn, network_pub, now_unix)?
+                .into_iter()
+                .map(|v| v.version_id)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        relayable_ids.extend(
+            relayable_domain_versions(conn, network_pub, &allowed, now_unix)?
+                .into_iter()
+                .map(|v| v.version_id),
+        );
+        compute_delta_paged_filtered(
+            conn,
+            peer_frontier,
+            requested_holes,
+            &allowed,
+            batch_budget,
+            Some(&relayable_ids),
+        )?
     } else {
         allowed.retain(|channel| !channel.starts_with("private:"));
         crate::family::page(
             conn,
+            network_pub,
             &recipient_b64,
             &public_key_to_base64(network_pub.as_bytes()),
             peer_frontier,
             requested_holes,
             &allowed,
             batch_budget,
+            now_unix,
         )?
     };
 

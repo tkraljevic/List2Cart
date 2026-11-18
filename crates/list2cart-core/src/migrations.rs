@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 // Fixed UUID namespace for deterministic v1 -> v2 backfill of legacy rows without sync_id.
 const MIGRATION_NS: Uuid = Uuid::from_u128(0x6c32632d_6d69_4772_8174_696f6e5f7632);
@@ -91,6 +91,40 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    if current_ver < 7 {
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        add_column_if_missing(&tx, "products", "image_hash", "TEXT NOT NULL DEFAULT ''")?;
+        tx.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS content_blobs (
+                hash TEXT PRIMARY KEY,
+                mime TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                data BLOB,
+                source TEXT NOT NULL DEFAULT 'local',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS content_refs (
+                hash TEXT NOT NULL,
+                entity TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                channel TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (hash, entity, entity_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_content_refs_entity ON content_refs(entity, entity_id);
+            CREATE TABLE IF NOT EXISTS content_wants (
+                hash TEXT PRIMARY KEY,
+                mime TEXT NOT NULL,
+                expected_bytes INTEGER NOT NULL DEFAULT 0,
+                channel TEXT NOT NULL DEFAULT '',
+                requested_at TEXT NOT NULL DEFAULT ''
+            );
+            INSERT INTO schema_migrations(version, applied_at) VALUES (7, datetime('now'));
+            ",
+        )
+        .map_err(|e| format!("Greska migracije spremista sadrzaja: {e}"))?;
         tx.commit().map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -533,7 +567,7 @@ pub fn bind_or_verify_device_key_fingerprint(
     external_pub_key_b64: Option<&str>,
 ) -> Result<(), String> {
     if let Some(key) = external_pub_key_b64 {
-        list2cart_sync::identity::parse_public_key(key)
+        syncnet::identity::parse_public_key(key)
             .map_err(|e| format!("Neispravan vanjski kljuc: {e}"))?;
     }
     let stored: Option<String> = conn
@@ -578,7 +612,7 @@ mod tests {
     use super::*;
     use crate::ledger::init_ledger_schema;
     use ed25519_dalek::SigningKey;
-    use list2cart_sync::identity::verifying_key_to_base64;
+    use syncnet::identity::verifying_key_to_base64;
 
     fn legacy_database() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
