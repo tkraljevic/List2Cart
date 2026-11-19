@@ -5,6 +5,12 @@ ignore = [
   "RUSTSEC-2024-0370",
   # Informativna obavijest za chrono (koristi se samo za RFC3339 vremenske oznake).
   "RUSTSEC-2026-0543",
+  # zbus_names, zvariant i zvariant_derive: tranzitivno kroz tauri-plugin-opener (Linux D-Bus, zbus 5).
+  # Nisu propusti nego obavijest da su spojeni u zbus 6; maknuti kad Tauri prijeđe na zbus 6.
+  # Iznimku odobrio korisnik 19. 11. 2026.
+  "RUSTSEC-2026-0370",
+  "RUSTSEC-2026-0371",
+  "RUSTSEC-2026-0372",
 ]
 
 [licenses]

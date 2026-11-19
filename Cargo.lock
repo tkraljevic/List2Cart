@@ -2405,7 +2405,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "list2cart"
-version = "0.0.2-alpha"
+version = "0.0.3-alpha"
 dependencies = [
  "list2cart-core",
  "serde",
@@ -2419,7 +2419,7 @@ dependencies = [
 
 [[package]]
 name = "list2cart-core"
-version = "0.0.2-alpha"
+version = "0.0.3-alpha"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5905,7 +5905,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.2-alpha"
+version = "0.0.3-alpha"
 
 [[package]]
 name = "yasna"
