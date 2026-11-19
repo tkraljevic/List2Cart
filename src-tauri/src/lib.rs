@@ -293,6 +293,18 @@ fn toggle_planned_item(
 }
 
 #[tauri::command]
+fn remove_planned_item(state: State<'_, AppState>, item_sync_id: String) -> Result<(), String> {
+    let res = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        db.remove_planned_item(&item_sync_id)
+    };
+    if res.is_ok() {
+        state.notify_lan_change();
+    }
+    res
+}
+
+#[tauri::command]
 async fn lookup_barcode_online(barcode: String) -> Result<Option<OnlineProductInfo>, String> {
     fetch_openfoodfacts_product(&barcode).await
 }
@@ -878,6 +890,7 @@ pub fn run() {
             create_shopping_list,
             add_planned_item,
             toggle_planned_item,
+            remove_planned_item,
             lookup_barcode_online,
             save_pocketbase_url,
             get_pocketbase_url,

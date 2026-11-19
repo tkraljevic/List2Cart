@@ -188,6 +188,10 @@ export async function togglePlannedItem(itemId: number, checked: boolean): Promi
   return invoke<void>("toggle_planned_item", { itemId, checked });
 }
 
+export async function removePlannedItem(itemSyncId: string): Promise<void> {
+  return invoke<void>("remove_planned_item", { itemSyncId });
+}
+
 export async function lookupBarcodeOnline(barcode: string): Promise<OnlineProductInfo | null> {
   return invoke<OnlineProductInfo | null>("lookup_barcode_online", { barcode });
 }
