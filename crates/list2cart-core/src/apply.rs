@@ -764,10 +764,12 @@ pub(crate) fn verify_domain_version_auth(
         else {
             return Err("Autor nema valjanu ulogu članstva u trenutku nastanka verzije".into());
         };
-        if role_rec.role != MemberRole::OwnDevice || role_rec.principal_id != target_principal {
+        // Each person writes only their own private channel. A family member is a person
+        // too: their signed role names their own principal, never the owner's, and that
+        // channel is sent only to devices of the same principal, so it stays theirs.
+        if role_rec.principal_id != target_principal {
             return Err(
-                "Privatni kanal dopusten je iskljucivo provjerenom vlastitom uredjaju istog principala"
-                    .to_owned(),
+                "Privatni kanal dopusten je iskljucivo uredjaju istog principala".to_owned(),
             );
         }
         return Ok(());

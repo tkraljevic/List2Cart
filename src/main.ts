@@ -9,6 +9,11 @@ import {
   addNetworkMember,
   retailSources,
   retailSearch,
+  retailAllSources,
+  retailHomeBranches,
+  setRetailHomeBranches,
+  removeRetailHomeBranch,
+  retailSearchHome,
   inspectPriceCsv,
   readPriceCsv,
   saveSyncPackage,
@@ -66,7 +71,7 @@ import type {
   PairStatusView,
   PeerSyncRecord,
 } from "./api";
-import type { PriceSource, RetailResults, RetailProduct, CsvInspection, CsvMapping } from "./api";
+import type { PriceSource, RetailResults, RetailProduct, CsvInspection, CsvMapping, HomeBranch } from "./api";
 import { SyncTracker } from "./sync-progress";
 import { compareBasket, formatDate, formatQuantity, resolveBasketProduct, sharedListNames } from "./shopping";
 import type { BasketComparison } from "./shopping";
@@ -74,6 +79,9 @@ import { icon } from "./icons";
 import { renderNavigation, renderProductTabs } from "./ui/shell";
 import { editCartItem, renderCartEditor } from "./ui/commerce/cart-editor";
 import { renderListCards } from "./ui/commerce/lists";
+import { createListWithRefresh, listCreationError } from "./ui/commerce/list-creation";
+import { CHAINS, chainForStoreName, chainName, formatOfferToast, matchLocalProducts, rankOffers, renderBranchSetup, renderQuickFind, suggestPicks } from "./ui/commerce/quick-find";
+import type { BranchSetupState, QuickFindState } from "./ui/commerce/quick-find";
 import { renderFamily, renderMemberDialog as renderMemberView } from "./ui/family";
 import { renderAbout } from "./ui/about";
 import { renderPairingDialog as renderPairingView } from "./ui/pairing";
@@ -85,6 +93,11 @@ import "./ui/family-sync.css";
 const syncTracker = new SyncTracker(() => render());
 const retail = {sources:[] as PriceSource[],results:null as RetailResults|null,query:"",branch:"",busy:false,error:"",storeId:0};
 const localPriceCsv = {bytes:[] as number[],inspection:null as CsvInspection|null,filename:"",products:null as RetailProduct[]|null,storeId:0};
+/** Suggestions under the list's add field: own products and today's price lists. */
+const quickFind: QuickFindState = { query: "", busy: false, error: "", results: null, searchedQuery: "" };
+let quickFindSeq = 0;
+let homeBranches: HomeBranch[] = [];
+const branchSetup: BranchSetupState & { open: boolean } = { open: false, place: "", all: null, busy: false, error: "", picked: {} };
 import type {
   CartItem,
   LedgerStats,
@@ -185,6 +198,13 @@ interface AppModel {
   draftModalBarcode: string;
   selectedListId: number | null;
   newListOpen: boolean;
+  newListBusy: boolean;
+  newListError: string;
+  draftNewListStoreId: number | null;
+  /** The new list is shared with every member of the network. */
+  draftNewListShared: boolean;
+  /** This device can share lists: it holds the network key or a delegation. */
+  canShareLists: boolean;
   selectedReceipt: ReceiptSummary | null;
   receiptSearch: string;
   receiptStore: string;
@@ -257,6 +277,11 @@ const model: AppModel = {
   draftModalBarcode: "",
   selectedListId: null,
   newListOpen: false,
+  newListBusy: false,
+  newListError: "",
+  draftNewListStoreId: null,
+  draftNewListShared: false,
+  canShareLists: false,
   selectedReceipt: null,
   receiptSearch: "",
   receiptStore: "",
@@ -449,6 +474,154 @@ function renderKosarica(): string {
     </div>`;
 }
 
+/** The latest pairing status knows best; before it loads, the value read at start. */
+function canShareLists(): boolean {
+  return model.pairStatus?.can_admit ?? model.canShareLists;
+}
+
+function quickFindHtml(): string {
+  const list = currentList();
+  return renderQuickFind(quickFind, {
+    local: matchLocalProducts(model.products, quickFind.query),
+    home: homeBranches,
+    listChain: list?.store_name ? retailerChain(list.store_name) : null,
+    escape: escapeHtml,
+  });
+}
+
+/** Redraws only the suggestions, so typing in the field keeps its focus and caret. */
+function refreshQuickFind(): void {
+  const slot = document.getElementById("quick-find-slot");
+  if (!slot) return;
+  slot.innerHTML = quickFindHtml();
+  bindQuickFind();
+}
+
+function resetQuickFind(): void {
+  quickFindSeq++;
+  Object.assign(quickFind, { query: "", busy: false, error: "", results: null, searchedQuery: "" });
+}
+
+async function runQuickSearch(chains: string[] | null): Promise<void> {
+  const query = quickFind.query.trim();
+  if (query.length < 2 || quickFind.busy) return;
+  const seq = ++quickFindSeq;
+  Object.assign(quickFind, { busy: true, error: "", results: null });
+  refreshQuickFind();
+  try {
+    const results = await retailSearchHome(query, chains);
+    if (seq !== quickFindSeq) return;
+    Object.assign(quickFind, { results, searchedQuery: quickFind.query });
+  } catch (error) {
+    if (seq !== quickFindSeq) return;
+    quickFind.error = `Pretraga nije uspjela: ${error}`;
+  } finally {
+    if (seq === quickFindSeq) {
+      quickFind.busy = false;
+      refreshQuickFind();
+    }
+  }
+}
+
+async function addSuggestedItem(item: { barcode: string | null; name: string; unit: Unit; priceCents: number }, toast: string): Promise<void> {
+  const list = currentList();
+  if (!list) return;
+  try {
+    await addPlannedItem({ listId: list.id, barcode: item.barcode, name: item.name, quantity: 1, unit: item.unit, estimatedPriceCents: item.priceCents });
+  } catch (error) {
+    showToast(`Artikl nije dodan: ${error}`);
+    return;
+  }
+  resetQuickFind();
+  model.draftPlanName = "";
+  model.lists = await listShoppingLists();
+  render();
+  document.getElementById("inp-plan-name")?.focus();
+  showToast(toast);
+}
+
+function bindQuickFind(): void {
+  document.querySelectorAll<HTMLButtonElement>("[data-qf-search]").forEach(button => {
+    button.onclick = () => void runQuickSearch(button.dataset.qfSearch === "all" ? null : [button.dataset.qfSearch!]);
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-qf-setup]").forEach(button => {
+    button.onclick = () => { branchSetup.open = true; render(); document.getElementById("branch-place")?.focus(); };
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-qf-local]").forEach(button => {
+    button.onclick = () => {
+      const product = model.products.find(p => p.barcode === button.dataset.qfLocal);
+      if (!product) return;
+      const where = product.last_store_name ? ` · ${product.last_store_name} ${formatCents(product.last_price_cents)}` : "";
+      void addSuggestedItem({ barcode: product.barcode, name: product.name, unit: product.default_unit, priceCents: product.last_price_cents }, `Dodano: ${product.name}${where}`);
+    };
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-qf-offer]").forEach(button => {
+    button.onclick = () => {
+      const offer = quickFind.results ? rankOffers(quickFind.results)[Number(button.dataset.qfOffer)] : undefined;
+      if (!offer) return;
+      void addSuggestedItem({ barcode: offer.product.barcode, name: offer.product.name, unit: "kom", priceCents: offer.priceCents }, formatOfferToast(offer));
+    };
+  });
+}
+
+/** Redraws the page and keeps the branch picker in view; a full render starts at the top. */
+function renderSetup(): void {
+  render();
+  document.getElementById("branch-setup")?.scrollIntoView({ block: "nearest" });
+}
+
+function bindBranchSetup(): void {
+  const close = document.querySelector<HTMLButtonElement>("[data-branch-close]");
+  if (close) close.onclick = () => { branchSetup.open = false; render(); };
+  const form = document.getElementById("branch-place-form") as HTMLFormElement | null;
+  const place = document.getElementById("branch-place") as HTMLInputElement | null;
+  if (place) place.oninput = () => { branchSetup.place = place.value; };
+  if (form) form.onsubmit = async event => {
+    event.preventDefault();
+    if (branchSetup.busy) return;
+    branchSetup.place = place?.value ?? branchSetup.place;
+    if (!branchSetup.place.trim()) { branchSetup.error = "Upiši grad ili poštanski broj."; renderSetup(); return; }
+    branchSetup.error = "";
+    if (!branchSetup.all || branchSetup.all.some(c => c.error)) {
+      branchSetup.busy = true;
+      renderSetup();
+      try { branchSetup.all = await retailAllSources(); }
+      catch (error) { branchSetup.error = `Poslovnice nisu učitane: ${error}`; }
+      finally { branchSetup.busy = false; }
+    }
+    if (branchSetup.all) {
+      branchSetup.picked = suggestPicks(branchSetup.all, branchSetup.place, homeBranches);
+      if (!Object.keys(branchSetup.picked).length) branchSetup.error = "Za to mjesto nije nađena nijedna poslovnica. Probaj drugi grad ili poštanski broj.";
+    }
+    renderSetup();
+  };
+  document.querySelectorAll<HTMLSelectElement>("[data-branch-pick]").forEach(select => {
+    select.onchange = () => { branchSetup.picked[select.dataset.branchPick!] = select.value; renderSetup(); };
+  });
+  const save = document.querySelector<HTMLButtonElement>("[data-branch-save]");
+  if (save) save.onclick = async () => {
+    const urls = Object.values(branchSetup.picked).filter(Boolean);
+    if (!urls.length || branchSetup.busy) return;
+    try {
+      homeBranches = await setRetailHomeBranches(urls);
+      Object.assign(branchSetup, { open: false, error: "", picked: {} });
+      render();
+      showToast(`Spremljeno: ${homeBranches.map(h => chainName(h.chain)).join(", ")}.`);
+      document.getElementById("inp-plan-name")?.focus();
+    } catch (error) {
+      branchSetup.error = `Poslovnice nisu spremljene: ${error}`;
+      renderSetup();
+    }
+  };
+  document.querySelectorAll<HTMLButtonElement>("[data-branch-remove]").forEach(button => {
+    button.onclick = async () => {
+      try { homeBranches = await removeRetailHomeBranch(button.dataset.branchRemove!); }
+      catch (error) { showToast(`Poslovnica nije uklonjena: ${error}`); return; }
+      renderSetup();
+    };
+  });
+}
+
 function renderPlaner(): string {
   const list = currentList();
   const items = list?.items ?? [];
@@ -457,18 +630,22 @@ function renderPlaner(): string {
   const lineTotal = (item: typeof items[number]) => calcLineCents(item.quantity, item.unit, item.estimated_price_cents);
   const total = items.reduce((sum, i) => sum + lineTotal(i), 0);
   const remainingTotal = remaining.reduce((sum, i) => sum + lineTotal(i), 0);
-  return `${pageHeader("Popisi", "Pripremite kupnju i označite kupljene artikle.", `<div class="header-actions">${model.lists.length ? `<select id="active-list-select" aria-label="Aktivni popis">${model.lists.map(l => `<option value="${l.id}" ${l.id === list?.id ? "selected" : ""}>${escapeHtml(l.name)}</option>`).join("")}</select>` : ""}<button class="btn btn-outline" id="btn-new-list" aria-expanded="${model.newListOpen}">${icon("plus")} Novi popis</button></div>`)}
+  return `${pageHeader("Popisi", "Pripremite kupnju i označite kupljene artikle.", `<div class="header-actions">${model.lists.length ? `<select id="active-list-select" aria-label="Aktivni popis">${model.lists.map(l => `<option value="${l.id}" ${l.id === list?.id ? "selected" : ""}>${escapeHtml(l.name)}</option>`).join("")}</select>` : ""}<button class="btn btn-outline" id="btn-new-list" aria-expanded="${model.newListOpen}" ${model.newListBusy ? "disabled" : ""}>${icon("plus")} Novi popis</button></div>`)}
     ${renderListCards(model.lists, list?.id, escapeHtml)}
-    ${model.newListOpen ? `<section class="card no-print" aria-label="Novi popis"><h2>Novi popis za kupnju</h2><div class="row-wrap">
-      <label class="field grow">Naziv popisa<input id="inp-new-list" value="${escapeHtml(model.draftNewList)}" placeholder="Npr. Tjedna nabavka" /></label>
-      <label class="field">Trgovina<select id="sel-list-store"><option value="">Sve trgovine</option>${model.stores.map(s => `<option value="${s.id}" ${s.id === model.selectedStoreId ? "selected" : ""}>${escapeHtml(s.name)}</option>`).join("")}</select></label>
-      <button class="btn btn-primary" id="btn-create-list">Kreiraj popis</button></div></section>` : ""}
-    ${list ? `<section class="card plan-add no-print"><div class="row"><input id="inp-plan-name" aria-label="Artikl za popis" value="${escapeHtml(model.draftPlanName)}" placeholder="Dodaj artikl na popis…" /><button class="btn btn-primary" id="btn-add-planned">Dodaj</button></div>
+    ${model.newListOpen ? `<section class="card no-print" aria-label="Novi popis" aria-busy="${model.newListBusy}"><h2>Novi popis za kupnju</h2><form id="new-list-form" class="row-wrap">
+      <label class="field grow">Naziv popisa<input id="inp-new-list" value="${escapeHtml(model.draftNewList)}" placeholder="Npr. Tjedna nabavka" required ${model.newListBusy ? "disabled" : ""} /></label>
+      <label class="field">Trgovina<select id="sel-list-store" ${model.newListBusy ? "disabled" : ""}><option value="" ${model.draftNewListStoreId === null ? "selected" : ""}>Sve trgovine</option>${model.stores.map(s => `<option value="${s.id}" ${s.id === model.draftNewListStoreId ? "selected" : ""}>${escapeHtml(s.name)}</option>`).join("")}</select></label>
+      ${canShareLists() ? `<label class="field shared-toggle"><span><input type="checkbox" id="chk-list-shared" ${model.draftNewListShared ? "checked" : ""} ${model.newListBusy ? "disabled" : ""} /> Zajednički popis</span><span class="item-sub">Vide ga i uređuju svi članovi obitelji i tvoji uređaji.</span></label>` : ""}
+      <button class="btn btn-primary" id="btn-create-list" type="submit" ${model.newListBusy ? "disabled" : ""}>${model.newListBusy ? "Spremanje…" : "Kreiraj popis"}</button></form>
+      ${model.newListError ? `<p class="error-inline" role="alert">${escapeHtml(model.newListError)}</p>` : ""}</section>` : ""}
+    ${list ? `<section class="card plan-add no-print"><div class="row"><input id="inp-plan-name" aria-label="Artikl za popis" value="${escapeHtml(model.draftPlanName)}" placeholder="Dodaj artikl na popis… (npr. linolada)" autocomplete="off" /><button class="btn btn-primary" id="btn-add-planned">Dodaj</button></div>
+      <div id="quick-find-slot" aria-live="polite">${quickFindHtml()}</div>
       <details class="plan-details" ${model.draftPlanPrice || model.draftPlanQty !== "1" || model.draftPlanUnit !== "kom" ? "open" : ""}><summary>Količina i procjena cijene</summary><div class="row-wrap">
         <label class="field grow">Količina<input id="inp-plan-qty" type="number" min="0.001" step="0.001" value="${escapeHtml(model.draftPlanQty)}" /></label>
         <label class="field grow">Jedinica<select id="inp-plan-unit">${unitOptions(model.draftPlanUnit)}</select></label>
         <label class="field grow">Cijena (€)<input id="inp-plan-price" inputmode="decimal" value="${escapeHtml(model.draftPlanPrice)}" placeholder="0,00" /></label>
       </div></details></section>
+      ${branchSetup.open ? renderBranchSetup(branchSetup, homeBranches, escapeHtml) : ""}
       <section class="card plan-progress"><div class="row space-between"><span class="item-sub">${checked} od ${items.length} kupljeno</span><strong class="item-price">${escapeHtml(formatCents(total))}</strong></div><div class="progress-track" role="progressbar" aria-label="Kupljeni artikli" aria-valuemin="0" aria-valuemax="${Math.max(items.length, 1)}" aria-valuenow="${checked}"><div class="progress-fill" style="width:${items.length ? checked / items.length * 100 : 0}%"></div></div></section>
       <div class="plan-layout"><section class="card plan-items" aria-label="Stavke popisa ${escapeHtml(list.name)}">
         ${items.length ? items.map(item => `<div class="plan-row ${item.checked ? "is-checked" : ""}"><label class="row grow"><input type="checkbox" data-toggle-plan="${item.id}" ${item.checked ? "checked" : ""} /><span class="item-copy"><span class="item-title">${escapeHtml(item.name)}</span><span class="item-sub">${formatQuantity(item.quantity)} ${item.unit === "l" ? "L" : item.unit}</span></span></label><span class="item-price">${escapeHtml(formatCents(lineTotal(item)))}</span><button class="icon-button btn-danger-ghost no-print" type="button" data-remove-plan="${escapeHtml(item.sync_id)}" aria-label="Ukloni ${escapeHtml(item.name)}">${icon("close")}</button></div>`).join("") : '<div class="empty-state"><h2>Što trebate kupiti?</h2><p>Dodajte prvi artikl na ovaj popis.</p></div>'}
@@ -718,8 +895,7 @@ async function refreshConflictData(): Promise<void> {
 }
 
 function retailerChain(name:string):string|null {
-  const lower=name.toLowerCase();
-  return ["konzum","lidl","kaufland","spar"].find(chain=>lower.includes(chain)) ?? null;
+  return chainForStoreName(name);
 }
 
 function renderRetailSearch():string {
@@ -801,7 +977,7 @@ function bindRetailSearch():void {
   if(load) load.onclick=async()=>{
     if(retail.busy)return;
     const selected=activeStore(); const chain=selected?retailerChain(selected.name):null;
-    if(!chain){retail.error="Podržani su Konzum, Lidl, Kaufland i Spar. Odaberi jednu od tih trgovina.";render();return;}
+    if(!chain){retail.error=`Podržani su ${CHAINS.map(chainName).join(", ")}. Odaberi jednu od tih trgovina.`;render();return;}
     localPriceCsv.products=null;localPriceCsv.inspection=null;localPriceCsv.bytes=[];
     retail.busy=true;retail.error="";retail.sources=[];retail.results=null;retail.branch="";retail.storeId=selected!.id;render();
     try{retail.sources=await retailSources(chain);}
@@ -1191,6 +1367,8 @@ function bindEvents(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-store-plan]").forEach((btn) => {
     btn.onclick = () => {
       model.selectedStoreId = Number(btn.dataset.storePlan);
+      model.draftNewListStoreId = model.selectedStoreId;
+      model.newListError = "";
       model.newListOpen = true;
       model.tab = "planer";
       render();
@@ -1623,8 +1801,11 @@ function bindEvents(): void {
   const btnNewList = document.getElementById("btn-new-list");
   if (btnNewList) {
     btnNewList.onclick = () => {
+      if (model.newListBusy) return;
       model.newListOpen = !model.newListOpen;
+      model.newListError = "";
       render();
+      if (model.newListOpen) document.getElementById("inp-new-list")?.focus();
     };
   }
 
@@ -1635,19 +1816,45 @@ function bindEvents(): void {
     };
   }
 
-  const btnCreateList = document.getElementById("btn-create-list");
-  if (btnCreateList) {
-    btnCreateList.onclick = async () => {
+  const newListStore = document.getElementById("sel-list-store") as HTMLSelectElement | null;
+  if (newListStore) newListStore.onchange = () => {
+    model.draftNewListStoreId = newListStore.value ? Number(newListStore.value) : null;
+  };
+  const newListShared = document.getElementById("chk-list-shared") as HTMLInputElement | null;
+  if (newListShared) newListShared.onchange = () => {
+    model.draftNewListShared = newListShared.checked;
+  };
+  const newListForm = document.getElementById("new-list-form") as HTMLFormElement | null;
+  if (newListForm) {
+    newListForm.onsubmit = async event => {
+      event.preventDefault();
+      if (model.newListBusy) return;
       const name = (inpNewList?.value ?? model.draftNewList).trim();
-      const rawStore = (document.getElementById("sel-list-store") as HTMLSelectElement | null)?.value ?? "";
-      const storeId = rawStore ? Number(rawStore) : null;
+      const storeId = model.draftNewListStoreId;
       if (!name) return showToast("Unesite naziv popisa.");
-      const created = await createShoppingList(name, storeId);
-      model.draftNewList = "";
-      model.newListOpen = false;
-      model.selectedListId = created.id;
-      model.lists = await listShoppingLists();
+      model.draftNewList = name;
+      let refreshNote = "";
+      model.newListBusy = true;
+      model.newListError = "";
       render();
+      try {
+        const result = await createListWithRefresh(name, storeId, {
+          create: createShoppingList, refresh: listShoppingLists,
+        }, canShareLists() && model.draftNewListShared);
+        model.selectedListId = result.created.id;
+        model.lists = result.lists ?? [result.created, ...model.lists.filter(list => list.id !== result.created.id)];
+        model.draftNewList = "";
+        model.draftNewListShared = false;
+        model.newListOpen = false;
+        refreshNote = result.refreshError ? "Popis je spremljen. Ostale popise trenutačno nije moguće osvježiti." : "";
+      } catch (error) {
+        model.newListError = listCreationError(error);
+      } finally {
+        model.newListBusy = false;
+        render();
+      }
+      // Through showToast, so the note also goes away again.
+      if (refreshNote) showToast(refreshNote);
     };
   }
 
@@ -1658,8 +1865,24 @@ function bindEvents(): void {
   if (inpPlanName) {
     inpPlanName.oninput = () => {
       model.draftPlanName = inpPlanName.value;
+      if (quickFind.query !== inpPlanName.value) {
+        quickFindSeq++;
+        Object.assign(quickFind, { query: inpPlanName.value, busy: false, error: "" });
+        refreshQuickFind();
+      }
+    };
+    inpPlanName.onkeydown = event => {
+      if (event.key === "Enter" && !event.isComposing) {
+        event.preventDefault();
+        document.getElementById("btn-add-planned")?.click();
+      } else if (event.key === "Escape" && quickFind.query) {
+        resetQuickFind();
+        refreshQuickFind();
+      }
     };
   }
+  bindQuickFind();
+  bindBranchSetup();
   if (inpPlanQty) {
     inpPlanQty.oninput = () => {
       model.draftPlanQty = inpPlanQty.value;
@@ -1696,8 +1919,10 @@ function bindEvents(): void {
       model.draftPlanQty = "1";
       model.draftPlanUnit = "kom";
       model.draftPlanPrice = "";
+      resetQuickFind();
       model.lists = await listShoppingLists();
       render();
+      document.getElementById("inp-plan-name")?.focus();
     };
   }
 
@@ -2416,6 +2641,8 @@ async function init() {
     model.pendingSasCode = await newSasCode();
     model.incompleteReceipts = await incompleteReceiptCount();
     model.conflicts = await identityConflicts();
+    homeBranches = await retailHomeBranches().catch(() => []);
+    model.canShareLists = await getPairStatus().then(status => status?.can_admit ?? false).catch(() => false);
     const pbUrl = await getPocketbaseUrl();
     if (pbUrl) model.pocketbaseUrl = pbUrl;
     void listenLanStatusChanged((st) => {

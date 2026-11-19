@@ -60,6 +60,94 @@ async fn retail_search(
     state.retail.search(&source_url, &query).await
 }
 
+const HOME_BRANCHES_KEY: &str = "retail_home_branches";
+
+fn read_home_branches(state: &AppState) -> Result<Vec<list2cart_core::retail::HomeBranch>, String> {
+    let saved = state
+        .db
+        .lock()
+        .map_err(|_| "Greska zakljucavanja baze")?
+        .get_setting(HOME_BRANCHES_KEY)?;
+    // A damaged value only means the branches have to be chosen again.
+    Ok(saved
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default())
+}
+fn write_home_branches(
+    state: &AppState,
+    branches: &[list2cart_core::retail::HomeBranch],
+) -> Result<(), String> {
+    let json = serde_json::to_string(branches).map_err(|e| e.to_string())?;
+    state
+        .db
+        .lock()
+        .map_err(|_| "Greska zakljucavanja baze")?
+        .set_setting(HOME_BRANCHES_KEY, &json)
+}
+#[tauri::command]
+async fn retail_all_sources(
+    state: State<'_, AppState>,
+) -> Result<Vec<list2cart_core::retail::ChainSources>, String> {
+    Ok(state.retail.all_sources().await)
+}
+#[tauri::command]
+fn retail_home_branches(
+    state: State<'_, AppState>,
+) -> Result<Vec<list2cart_core::retail::HomeBranch>, String> {
+    read_home_branches(&state)
+}
+/// Saves the chosen branches, one per chain; a chain not mentioned keeps its branch.
+#[tauri::command]
+fn set_retail_home_branches(
+    state: State<'_, AppState>,
+    source_urls: Vec<String>,
+) -> Result<Vec<list2cart_core::retail::HomeBranch>, String> {
+    let mut branches = read_home_branches(&state)?;
+    for url in source_urls {
+        let source = state.retail.registered_source(&url)?;
+        branches.retain(|b| b.chain != source.chain);
+        branches.push(list2cart_core::retail::HomeBranch {
+            chain: source.chain,
+            branch_key: source.branch_key,
+            label: source.label,
+        });
+    }
+    branches.sort_by_key(|b| {
+        list2cart_core::retail::CHAINS
+            .iter()
+            .position(|c| *c == b.chain)
+            .unwrap_or(usize::MAX)
+    });
+    write_home_branches(&state, &branches)?;
+    Ok(branches)
+}
+#[tauri::command]
+fn remove_retail_home_branch(
+    state: State<'_, AppState>,
+    chain: String,
+) -> Result<Vec<list2cart_core::retail::HomeBranch>, String> {
+    let mut branches = read_home_branches(&state)?;
+    branches.retain(|b| b.chain != chain);
+    write_home_branches(&state, &branches)?;
+    Ok(branches)
+}
+/// Searches the saved branches; `chains` limits it to some of them (one store).
+#[tauri::command]
+async fn retail_search_home(
+    state: State<'_, AppState>,
+    query: String,
+    chains: Option<Vec<String>>,
+) -> Result<Vec<list2cart_core::retail::BranchSearch>, String> {
+    let mut branches = read_home_branches(&state)?;
+    if let Some(chains) = chains {
+        branches.retain(|b| chains.contains(&b.chain));
+    }
+    if branches.is_empty() {
+        return Err("Najprije odaberite svoje poslovnice".into());
+    }
+    Ok(state.retail.search_branches(&branches, &query).await)
+}
+
 #[tauri::command]
 fn identity_conflicts(
     state: State<'_, AppState>,
@@ -238,10 +326,15 @@ fn create_shopping_list(
     state: State<'_, AppState>,
     name: String,
     store_id: Option<i64>,
+    shared: Option<bool>,
 ) -> Result<ShoppingList, String> {
     let res = {
         let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
-        db.create_shopping_list(&name, store_id)
+        if shared.unwrap_or(false) {
+            db.create_shared_shopping_list(&name, store_id)
+        } else {
+            db.create_shopping_list(&name, store_id)
+        }
     };
     if res.is_ok() {
         state.notify_lan_change();
@@ -870,6 +963,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             retail_sources,
             retail_search,
+            retail_all_sources,
+            retail_home_branches,
+            set_retail_home_branches,
+            remove_retail_home_branch,
+            retail_search_home,
             inspect_price_csv,
             read_price_csv,
             identity_conflicts,

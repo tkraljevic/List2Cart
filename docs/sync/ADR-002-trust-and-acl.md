@@ -37,3 +37,14 @@ goCOP modelira povjerenje preko `NetworkKey`, delegirane `Ovlast` uloge, `Member
    - Grant ID je nepromjenjiv; vraćanje pristupa zahtijeva novi grant ID. Opozvan uređaj zahtijeva novi ključ. Novije članstvo istog ključa ne može promijeniti principal, a staro članstvo ne može prepisati novije. Kontrolni cache i njegove promjene opoziva imaju atomski savepoint.
 6. **Izolacija legacy v1 importa**:
    - Uvoz starog `.list2cart.json` formata (bez kriptografskog potpisa) tretira se isključivo kao lokalni uvoz za uređaj na kojem ga je korisnik ručno pokrenuo i nikada ne upisuje zapise u `sync_trust_records`.
+
+## Dopuna 2026-11-19: član obitelji i zajednički popisi
+
+Test s tri uređaja u istoj mreži (vlasnik, njegov drugi uređaj, član obitelji) pokazao je da član obitelji nije mogao stvoriti ni popis ni račun, a zajednički popis do njega nikad nije stigao. Odluke:
+
+1. **Vlastiti privatni kanal piše svaki član.** `private:<principal_id>` smije pisati uređaj čija potpisana uloga nosi taj `principal_id`, bez obzira je li `OwnDevice` ili `FamilyMember`. Član obitelji ima vlastiti principal, nikad vlasnikov, a taj se kanal šalje samo uređajima istog principala, pa njegovi računi i popisi ostaju njegovi.
+2. **Zajednički popis nastaje u kanalu `list:<list_sync_id>`.** Stvara ga uređaj s mrežnim ključem ili `Ovlast` delegacijom (`Database::create_shared_shopping_list`). Pri stvaranju potpisuje `Write` grant sebi i svakom aktivnom članu mreže. Postojeći privatni popis se ne premješta (točka 3 izvornih odluka); dijeli se novim zajedničkim popisom.
+3. **Uparivanje predaje dokaze koje razgovor ne bi isporučio.** Razgovor šalje samo verzije novije od onih koje primatelj već ima, a paket dobrodošlice primatelju daje novije. Zato `OwnDevice` pri uparivanju dobiva cijelu potpisanu kontrolnu povijest, a svaki novi član grantove svih postojećih zajedničkih popisa (svoj i tuđe). Primatelj ih odmah upisuje i u kontrolni cache.
+4. **Obiteljski prijenos smije donijeti grant koji primatelj još nije vidio.** Početna provjera prijenosa (`only_unseen_grants`) propušta kanal `list:<id>` samo ako za tu stranu i taj popis lokalno ne postoji nikakav zapis o grantu. Grant koji je primatelj već vidio pa izgubio (opoziv, istek) i dalje odbija prijenos, a puna provjera ponavlja se nakon primjene dokaza.
+
+Testovi: `owner_and_own_device_use_the_app_and_see_each_others_lists_and_receipts`, `family_member_uses_the_app_privately_and_shares_only_the_shared_list` i `a_list_shared_after_pairing_reaches_every_member_and_only_the_owner_can_share` u `session.rs`.

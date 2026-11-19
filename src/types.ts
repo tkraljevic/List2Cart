@@ -81,6 +81,8 @@ export interface ShoppingList {
   items: PlannedItem[];
   total_estimated_cents: number;
   updated_at: string;
+  /** Seen and edited by every member of the network, family members included. */
+  shared?: boolean;
 }
 
 export interface OnlineProductInfo {

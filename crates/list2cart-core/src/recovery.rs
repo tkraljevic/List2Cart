@@ -204,6 +204,41 @@ fn family_access(ctx: &RecoveryContext<'_>, manifest: &SnapshotManifest) -> Resu
     Ok(())
 }
 
+/// True when every channel either side lacks is a list this device has no grant record
+/// for at all. A list shared after pairing arrives with its grants inside the transfer,
+/// so they are unseen here, not lost; the full check runs again once they are applied.
+/// A grant this device has seen (revoked or expired) still refuses the transfer.
+fn only_unseen_grants(
+    ctx: &RecoveryContext<'_>,
+    manifest: &SnapshotManifest,
+) -> Result<bool, String> {
+    let root = public_key_to_base64(ctx.network.as_bytes());
+    for key in [&manifest.sender, &manifest.recipient] {
+        if key == &root {
+            continue;
+        }
+        let allowed = allowed_channels_for_recipient(ctx.conn, ctx.network, key, ctx.now)?;
+        for channel in manifest.channels.difference(&allowed) {
+            let Some(list_id) = channel.strip_prefix("list:") else {
+                return Ok(false);
+            };
+            let seen: bool = ctx
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sync_trust_records
+                     WHERE kind = 'list_grant' AND subject_key = ?1 AND target_id = ?2)",
+                    params![key, list_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if seen {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn start_inner(
     ctx: RecoveryContext<'_>,
     recipient: &str,
@@ -567,6 +602,7 @@ pub(crate) fn import_page(
                 allowed_channels_for_recipient(ctx.conn, ctx.network, &sender, ctx.now)?;
             if sender != public_key_to_base64(ctx.network.as_bytes())
                 && !m.channels.is_subset(&sender_allowed)
+                && !only_unseen_grants(&ctx, m)?
             {
                 return Err(error);
             }

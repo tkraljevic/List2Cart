@@ -570,7 +570,17 @@ impl Database {
         name: &str,
         store_id: Option<i64>,
     ) -> Result<ShoppingList, String> {
-        self.local_create_list(name, store_id)
+        self.local_create_list(name, store_id, false)
+    }
+
+    /// A list every member of the network sees and edits, family members included.
+    /// Only a device that can admit members can make one.
+    pub fn create_shared_shopping_list(
+        &self,
+        name: &str,
+        store_id: Option<i64>,
+    ) -> Result<ShoppingList, String> {
+        self.local_create_list(name, store_id, true)
     }
 
     pub fn add_planned_item(
@@ -608,7 +618,9 @@ impl Database {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT sl.id, sl.sync_id, sl.name, sl.store_id, s.name, sl.updated_at
+                "SELECT sl.id, sl.sync_id, sl.name, sl.store_id, s.name, sl.updated_at,
+                        EXISTS(SELECT 1 FROM record_versions rv WHERE rv.entity = 'shopping_lists'
+                               AND rv.entity_id = sl.sync_id AND rv.channel = 'list:' || sl.sync_id)
                  FROM shopping_lists sl
                  LEFT JOIN stores s ON sl.store_id = s.id
                   WHERE sl.archived = 0
@@ -627,6 +639,7 @@ impl Database {
                     items: Vec::new(),
                     total_estimated_cents: 0,
                     updated_at: row.get(5)?,
+                    shared: row.get(6)?,
                 })
             })
             .map_err(|e| format!("Greska citanja popisa: {e}"))?;

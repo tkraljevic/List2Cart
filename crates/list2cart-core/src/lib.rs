@@ -19,6 +19,8 @@ pub mod online;
 pub mod pairing_session;
 pub mod recovery;
 pub mod retail;
+mod retail_archive;
+mod retail_zip;
 pub mod session;
 pub mod sync;
 

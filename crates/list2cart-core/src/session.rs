@@ -654,7 +654,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ledger::PeerRole, models::Unit, pairing_session::WelcomePack};
+    use crate::{
+        ledger::PeerRole,
+        models::{CartItem, Unit},
+        pairing_session::WelcomePack,
+    };
     use syncnet::{
         pairing::PairHello,
         wire::{
@@ -1170,5 +1174,272 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// Pairs `joiner` into `admin`'s network with the given role, as the app does.
+    fn pair_into(admin: &mut Database, joiner: &mut Database, role: PeerRole, name: &str) {
+        let admin_key = admin.clone_device_signing_key().verifying_key().to_bytes();
+        let joiner_key = joiner.clone_device_signing_key().verifying_key().to_bytes();
+        let hello = |db: &Database, name: &str| PairHello {
+            protocol: "list2cart".into(),
+            device_id: db.sync_identity().device_public_key,
+            name: name.into(),
+            version: "0.1.0".into(),
+            meta: BTreeMap::new(),
+            sas: 2,
+        };
+        let (admin_hello, joiner_hello) = (hello(admin, "Vlasnik"), hello(joiner, name));
+        let welcome = admin
+            .prepare_welcome_pack(&joiner_key, role, "*", true)
+            .unwrap();
+        let reply = joiner
+            .prepare_welcome_pack(&admin_key, PeerRole::OwnDevice, "*", false)
+            .unwrap();
+        admin
+            .finalize_pairing(
+                &joiner_hello,
+                &joiner_key,
+                "111222",
+                role,
+                "*",
+                Some(&welcome),
+                Some(&reply),
+            )
+            .unwrap();
+        joiner
+            .finalize_pairing(
+                &admin_hello,
+                &admin_key,
+                "111222",
+                PeerRole::OwnDevice,
+                "*",
+                Some(&WelcomePack::default()),
+                Some(&welcome),
+            )
+            .unwrap();
+    }
+
+    async fn sync_pair(a: &Arc<Mutex<Database>>, b: &Arc<Mutex<Database>>) -> Result<(), String> {
+        let key = |db: &Arc<Mutex<Database>>| {
+            db.lock()
+                .unwrap()
+                .clone_device_signing_key()
+                .verifying_key()
+                .to_bytes()
+        };
+        let (key_a, key_b) = (key(a), key(b));
+        let (mut io_a, mut io_b) = tokio::io::duplex(64 * 1024);
+        let (a2, b2) = (a.clone(), b.clone());
+        let cfg = SessionConfig::default();
+        let (cfg_a, cfg_b) = (cfg.clone(), cfg);
+        let (out_a, out_b) = tokio::join!(
+            tokio::spawn(async move {
+                run_conversation_until_idle(&mut io_a, &a2, &key_b, None, true, &cfg_a).await
+            }),
+            tokio::spawn(async move {
+                run_conversation_until_idle(&mut io_b, &b2, &key_a, None, false, &cfg_b).await
+            }),
+        );
+        match (out_a.unwrap(), out_b.unwrap()) {
+            (Ok(_), Ok(_)) => Ok(()),
+            (a, b) => Err(format!("A: {:?}; B: {:?}", a.err(), b.err())),
+        }
+    }
+
+    struct ThreeDevices {
+        owner: Arc<Mutex<Database>>,
+        own: Arc<Mutex<Database>>,
+        family: Arc<Mutex<Database>>,
+        shared_list: String,
+    }
+
+    /// One network: its owner, the owner's second device and a family member's device.
+    /// The owner's shared list "Zajednicki" exists before pairing, so it is opened to
+    /// both devices as they join.
+    fn three_devices() -> ThreeDevices {
+        let mut owner = Database::open_in_memory().unwrap();
+        let store = owner.add_store("Konzum", "Zagreb", "#c00").unwrap();
+        let shared = owner
+            .create_shared_shopping_list("Zajednicki", Some(store.id))
+            .unwrap();
+        assert!(shared.shared);
+        let mut own = Database::open_in_memory().unwrap();
+        let mut family = Database::open_in_memory().unwrap();
+        pair_into(
+            &mut owner,
+            &mut own,
+            PeerRole::OwnDevice,
+            "Moj drugi uredjaj",
+        );
+        pair_into(
+            &mut owner,
+            &mut family,
+            PeerRole::FamilyMember,
+            "Clan obitelji",
+        );
+        ThreeDevices {
+            owner: Arc::new(Mutex::new(owner)),
+            own: Arc::new(Mutex::new(own)),
+            family: Arc::new(Mutex::new(family)),
+            shared_list: shared.sync_id,
+        }
+    }
+
+    /// Creates a list with an item, a store and a receipt, as everyday use does.
+    fn use_the_app(db: &Database, who: &str) -> Result<(), String> {
+        let list = db.create_shopping_list(&format!("Popis od {who}"), None)?;
+        db.add_planned_item(list.id, None, "Kruh", 1.0, Unit::Kom, 199)?;
+        let store = db.add_store(&format!("Trgovina {who}"), "Split", "#0a0")?;
+        let item = CartItem {
+            id: "1".into(),
+            barcode: "3850000000001".into(),
+            name: "Jaja".into(),
+            quantity: 1.0,
+            unit: Unit::Kom,
+            unit_price_cents: 250,
+            total_cents: 250,
+            image_data_url: None,
+        };
+        db.save_receipt(store.id, &store.name, &[item], 250)?;
+        Ok(())
+    }
+
+    fn list_names(db: &Arc<Mutex<Database>>) -> Vec<String> {
+        let mut names: Vec<_> = db
+            .lock()
+            .unwrap()
+            .list_shopping_lists()
+            .unwrap()
+            .into_iter()
+            .map(|l| l.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn items_of(db: &Arc<Mutex<Database>>, list_sync_id: &str) -> Vec<String> {
+        let list = db
+            .lock()
+            .unwrap()
+            .list_shopping_lists()
+            .unwrap()
+            .into_iter()
+            .find(|l| l.sync_id == list_sync_id)
+            .unwrap_or_else(|| panic!("list {list_sync_id} is missing"));
+        let mut names: Vec<_> = list.items.into_iter().map(|i| i.name).collect();
+        names.sort();
+        names
+    }
+
+    fn add_item(db: &Arc<Mutex<Database>>, list_sync_id: &str, name: &str) -> Result<(), String> {
+        let db = db.lock().unwrap();
+        let list = db
+            .list_shopping_lists()?
+            .into_iter()
+            .find(|l| l.sync_id == list_sync_id)
+            .ok_or("popis nije stigao na uredjaj")?;
+        db.add_planned_item(list.id, None, name, 1.0, Unit::Kom, 99)
+            .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn owner_and_own_device_use_the_app_and_see_each_others_lists_and_receipts() {
+        let d = three_devices();
+        sync_pair(&d.owner, &d.own).await.unwrap();
+        use_the_app(&d.owner.lock().unwrap(), "vlasnik").unwrap();
+        use_the_app(&d.own.lock().unwrap(), "moj uredjaj").unwrap();
+        add_item(&d.owner, &d.shared_list, "Mlijeko vlasnik").unwrap();
+        add_item(&d.own, &d.shared_list, "Mlijeko moj uredjaj").unwrap();
+        sync_pair(&d.owner, &d.own).await.unwrap();
+        for db in [&d.owner, &d.own] {
+            assert_eq!(
+                list_names(db),
+                ["Popis od moj uredjaj", "Popis od vlasnik", "Zajednicki"]
+            );
+            assert_eq!(db.lock().unwrap().list_receipts().unwrap().len(), 2);
+            assert_eq!(
+                items_of(db, &d.shared_list),
+                ["Mlijeko moj uredjaj", "Mlijeko vlasnik"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn family_member_uses_the_app_privately_and_shares_only_the_shared_list() {
+        let d = three_devices();
+        sync_pair(&d.owner, &d.family).await.unwrap();
+        sync_pair(&d.owner, &d.own).await.unwrap();
+
+        // Their own lists, stores and receipts work, and stay on their device.
+        use_the_app(&d.family.lock().unwrap(), "clan obitelji").unwrap();
+        assert_eq!(
+            list_names(&d.family),
+            ["Popis od clan obitelji", "Zajednicki"]
+        );
+        // The shared list arrived; what they add reaches the owner and the owner's devices.
+        add_item(&d.family, &d.shared_list, "Jogurt clan").unwrap();
+        add_item(&d.owner, &d.shared_list, "Mlijeko vlasnik").unwrap();
+        sync_pair(&d.owner, &d.family).await.unwrap();
+        sync_pair(&d.owner, &d.own).await.unwrap();
+        for db in [&d.owner, &d.own, &d.family] {
+            assert_eq!(
+                items_of(db, &d.shared_list),
+                ["Jogurt clan", "Mlijeko vlasnik"]
+            );
+        }
+
+        // Nothing private crosses between the owner and the family member.
+        use_the_app(&d.owner.lock().unwrap(), "vlasnik").unwrap();
+        sync_pair(&d.owner, &d.family).await.unwrap();
+        assert_eq!(list_names(&d.owner), ["Popis od vlasnik", "Zajednicki"]);
+        assert_eq!(d.owner.lock().unwrap().list_receipts().unwrap().len(), 1);
+        assert_eq!(
+            list_names(&d.family),
+            ["Popis od clan obitelji", "Zajednicki"]
+        );
+        assert_eq!(d.family.lock().unwrap().list_receipts().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_list_shared_after_pairing_reaches_every_member_and_only_the_owner_can_share() {
+        let d = three_devices();
+        sync_pair(&d.owner, &d.own).await.unwrap();
+        sync_pair(&d.owner, &d.family).await.unwrap();
+        let later = d
+            .owner
+            .lock()
+            .unwrap()
+            .create_shared_shopping_list("Vikend", None)
+            .unwrap()
+            .sync_id;
+        sync_pair(&d.owner, &d.family).await.unwrap();
+        sync_pair(&d.owner, &d.own).await.unwrap();
+        add_item(&d.family, &later, "Ugljen").unwrap();
+        add_item(&d.own, &later, "Kobasice").unwrap();
+        sync_pair(&d.owner, &d.family).await.unwrap();
+        sync_pair(&d.owner, &d.own).await.unwrap();
+        sync_pair(&d.owner, &d.family).await.unwrap();
+        for db in [&d.owner, &d.own, &d.family] {
+            assert_eq!(items_of(db, &later), ["Kobasice", "Ugljen"]);
+            assert!(
+                db.lock()
+                    .unwrap()
+                    .list_shopping_lists()
+                    .unwrap()
+                    .iter()
+                    .find(|l| l.sync_id == later)
+                    .unwrap()
+                    .shared
+            );
+        }
+        // Granting needs the network key or a delegation, which neither device holds.
+        for db in [&d.family, &d.own] {
+            let refused = db.lock().unwrap().create_shared_shopping_list("Moj", None);
+            assert!(
+                refused
+                    .unwrap_err()
+                    .contains("samo uredjaj koji upravlja mrezom")
+            );
+        }
     }
 }

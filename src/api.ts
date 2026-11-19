@@ -19,10 +19,32 @@ import type {
 
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-export interface PriceSource {chain:string;label:string;url:string;price_date:string;}
-export interface RetailProduct {name:string;barcode:string|null;brand:string;package:string;price_cents:number;}
+export interface PriceSource {chain:string;label:string;url:string;price_date:string;branch_key?:string;postal_code?:string|null;}
+export interface RetailProduct {name:string;barcode:string|null;brand:string;package:string;price_cents:number;special_price_cents?:number|null;unit_price_cents?:number|null;unit_basis?:string|null;}
 export interface RetailResults {source:PriceSource;fetched_at:string;products:RetailProduct[];total_matches:number;}
-export interface CsvMapping {delimiter:number;name:number;price:number;barcode:number|null;brand:number|null;quantity:number|null;unit:number|null;}
+export interface CsvMapping {delimiter:number;name:number;price:number;barcode:number|null;brand:number|null;quantity:number|null;unit:number|null;unit_price?:number|null;unit_price_basis?:number|null;special_price?:number|null;}
+/** A branch chosen once; the app finds its price list for the current day. */
+export interface HomeBranch {chain:string;branch_key:string;label:string;}
+export interface BranchSearch {chain:string;branch_label:string;results:RetailResults|null;error:string|null;}
+export interface ChainSources {chain:string;sources:PriceSource[];error:string|null;}
+export async function retailAllSources():Promise<ChainSources[]> {
+  if (!isTauri()) return [];
+  return invoke<ChainSources[]>("retail_all_sources");
+}
+export async function retailHomeBranches():Promise<HomeBranch[]> {
+  if (!isTauri()) return [];
+  return invoke<HomeBranch[]>("retail_home_branches");
+}
+export async function setRetailHomeBranches(sourceUrls:string[]):Promise<HomeBranch[]> {
+  return invoke<HomeBranch[]>("set_retail_home_branches",{sourceUrls});
+}
+export async function removeRetailHomeBranch(chain:string):Promise<HomeBranch[]> {
+  return invoke<HomeBranch[]>("remove_retail_home_branch",{chain});
+}
+export async function retailSearchHome(query:string,chains:string[]|null):Promise<BranchSearch[]> {
+  if (!isTauri()) return [];
+  return invoke<BranchSearch[]>("retail_search_home",{query,chains});
+}
 export interface CsvInspection {headers:string[];sample:string[][];delimiter:number;suggested:CsvMapping|null;}
 export async function inspectPriceCsv(bytes:number[]):Promise<CsvInspection> {
   return invoke<CsvInspection>("inspect_price_csv",{bytes});
@@ -162,8 +184,9 @@ export async function listShoppingLists(): Promise<ShoppingList[]> {
   return invoke<ShoppingList[]>("list_shopping_lists");
 }
 
-export async function createShoppingList(name: string, storeId?: number | null): Promise<ShoppingList> {
-  return invoke<ShoppingList>("create_shopping_list", { name, storeId: storeId ?? null });
+/** A shared list is seen and edited by every member of the network, family included. */
+export async function createShoppingList(name: string, storeId?: number | null, shared = false): Promise<ShoppingList> {
+  return invoke<ShoppingList>("create_shopping_list", { name, storeId: storeId ?? null, shared });
 }
 
 export async function addPlannedItem(params: {

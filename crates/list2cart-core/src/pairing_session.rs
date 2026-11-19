@@ -519,61 +519,248 @@ pub fn prepare_welcome_pack(
     pack.control_versions.push(ctrl_version);
     pack.control_versions.push(role_version);
 
+    let mut list_ids: Vec<String> = Vec::new();
     if member_role == MemberRole::FamilyMember {
-        let list_ids: Vec<&str> = shared_lists
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "*")
-            .collect();
-        for list_id in list_ids {
-            let grant_id = format!("grant:{peer_b64}:{list_id}");
-            let g = if let Some(root_sk) = ctx.network_key {
-                let net = NetworkKey::from_signing_key(ctx.network_name, root_sk.clone());
-                issue_list_grant(
-                    &net,
-                    &grant_id,
-                    list_id,
-                    &peer_vk,
-                    ListPermission::Write,
-                    "root",
-                    validity,
-                )
-                .map_err(|e| e.to_string())?
-            } else if let Some(ref ovlast) = our_ovlast {
-                use base64::{Engine, engine::general_purpose::STANDARD};
-                use ed25519_dalek::Signer;
-                let mut g = ListGrant {
-                    network: public_key_to_base64(ctx.network_pub.as_bytes()),
-                    grant_id: grant_id.clone(),
-                    list_sync_id: list_id.to_owned(),
-                    recipient_pub_key: peer_b64.clone(),
-                    permission: ListPermission::Write,
-                    issued_by: our_b64.clone(),
-                    issued_at: validity.issued_at,
-                    expires_at: validity.expires_at().map_err(|e| e.to_string())?,
-                    signature: String::new(),
-                    admitter: Some(ovlast.clone()),
-                };
-                let sig = ctx.device_key.sign(&g.signed_bytes());
-                g.signature = STANDARD.encode(sig.to_bytes());
-                g
-            } else {
-                continue;
-            };
-            let gv = build_in_memory_control_version(
-                ctx.conn,
-                &signer_node,
-                signer_sk,
-                "list_grant",
-                &format!("list_grant:{}", g.grant_id),
-                &ControlPayload::ListGrant(g.clone()),
-            )?;
-            pack.grants.push(g);
-            pack.control_versions.push(gv);
+        list_ids.extend(
+            shared_lists
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "*")
+                .map(str::to_owned),
+        );
+    }
+    // Every shared list (`list:<id>` channel) is open to every member of the network,
+    // so a device that joins later can read and write the ones made before it.
+    for id in shared_list_ids(ctx.conn)? {
+        if !list_ids.contains(&id) {
+            list_ids.push(id);
         }
+    }
+    // A device of the same person may see every control record. Older ones would
+    // otherwise never reach it: a conversation sends what is newer than the records
+    // it already holds, and pairing hands it newer ones. Grants for shared lists made
+    // before it joined, and memberships of earlier members, would stay missing.
+    if member_role == MemberRole::OwnDevice {
+        for v in all_control_versions(ctx.conn)? {
+            if !pack
+                .control_versions
+                .iter()
+                .any(|c| c.version_id == v.version_id)
+            {
+                pack.control_versions.push(v);
+            }
+        }
+    }
+    // Proofs of who else may write each shared list go along: the joiner checks them
+    // before it accepts anyone's changes, and they are sent with the list's data anyway.
+    for list_id in shared_list_ids(ctx.conn)? {
+        for v in grant_versions_for_list(ctx.conn, &list_id)? {
+            if !pack
+                .control_versions
+                .iter()
+                .any(|c| c.version_id == v.version_id)
+            {
+                pack.control_versions.push(v);
+            }
+        }
+    }
+    for list_id in list_ids {
+        let Some((g, gv)) = sign_list_grant(
+            ctx,
+            our_ovlast.as_ref(),
+            (&signer_node, signer_sk),
+            &peer_vk,
+            &list_id,
+            validity,
+        )?
+        else {
+            continue;
+        };
+        pack.grants.push(g);
+        pack.control_versions.push(gv);
     }
 
     Ok(pack)
+}
+
+/// Every signed control version this device holds, oldest first.
+fn all_control_versions(conn: &Connection) -> Result<Vec<Version>, String> {
+    control_versions_where(conn, "1 = 1", params![])
+}
+
+/// Signed grants for one list, to any device; the grant ID ends with the list's ID.
+fn grant_versions_for_list(conn: &Connection, list_id: &str) -> Result<Vec<Version>, String> {
+    control_versions_where(
+        conn,
+        "entity = 'list_grant' AND entity_id LIKE 'list_grant:grant:%:' || ?1",
+        params![list_id],
+    )
+}
+
+fn control_versions_where(
+    conn: &Connection,
+    filter: &str,
+    args: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<Version>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT version_id, entity, entity_id, node_id, supersedes, archived, payload, created_at,
+                    schema_version, channel, author_pub_key, grant_ref, signature, created_at_unix
+             FROM record_versions WHERE channel = 'control' AND signature != '' AND ({filter})
+             ORDER BY version_id"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(args, |row| {
+            Ok(Version {
+                version_id: row.get(0)?,
+                entity: row.get(1)?,
+                entity_id: row.get(2)?,
+                node_id: row.get(3)?,
+                supersedes: row.get(4)?,
+                archived: row.get::<_, i32>(5)? != 0,
+                payload: row.get(6)?,
+                created_at: row.get(7)?,
+                schema_version: row.get(8)?,
+                channel: row.get(9)?,
+                author_pub_key: row.get(10)?,
+                grant_ref: row.get(11)?,
+                signature: row.get(12)?,
+                created_at_unix: row.get(13)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+/// Lists made shared: their versions are on a `list:<id>` channel.
+fn shared_list_ids(conn: &Connection) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT entity_id FROM record_versions
+             WHERE entity = 'shopping_lists' AND channel = 'list:' || entity_id AND signature != ''",
+        )
+        .map_err(|e| e.to_string())?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(ids)
+}
+
+/// Signs a write grant for one list with the network key, or with this device's
+/// delegation; None when this device holds neither and cannot grant.
+fn sign_list_grant(
+    ctx: &PairingContext<'_>,
+    our_ovlast: Option<&Ovlast>,
+    (signer_node, signer_sk): (&str, &SigningKey),
+    peer_vk: &VerifyingKey,
+    list_id: &str,
+    validity: Validity,
+) -> Result<Option<(ListGrant, Version)>, String> {
+    let peer_b64 = public_key_to_base64(peer_vk.as_bytes());
+    let grant_id = format!("grant:{peer_b64}:{list_id}");
+    let g = if let Some(root_sk) = ctx.network_key {
+        let net = NetworkKey::from_signing_key(ctx.network_name, root_sk.clone());
+        issue_list_grant(
+            &net,
+            &grant_id,
+            list_id,
+            peer_vk,
+            ListPermission::Write,
+            "root",
+            validity,
+        )
+        .map_err(|e| e.to_string())?
+    } else if let Some(ovlast) = our_ovlast {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use ed25519_dalek::Signer;
+        let mut g = ListGrant {
+            network: public_key_to_base64(ctx.network_pub.as_bytes()),
+            grant_id: grant_id.clone(),
+            list_sync_id: list_id.to_owned(),
+            recipient_pub_key: peer_b64,
+            permission: ListPermission::Write,
+            issued_by: public_key_to_base64(ctx.device_key.verifying_key().as_bytes()),
+            issued_at: validity.issued_at,
+            expires_at: validity.expires_at().map_err(|e| e.to_string())?,
+            signature: String::new(),
+            admitter: Some(ovlast.clone()),
+        };
+        let sig = ctx.device_key.sign(&g.signed_bytes());
+        g.signature = STANDARD.encode(sig.to_bytes());
+        g
+    } else {
+        return Ok(None);
+    };
+    let gv = build_in_memory_control_version(
+        ctx.conn,
+        signer_node,
+        signer_sk,
+        "list_grant",
+        &format!("list_grant:{}", g.grant_id),
+        &ControlPayload::ListGrant(g.clone()),
+    )?;
+    Ok(Some((g, gv)))
+}
+
+/// Opens a new shared list to every member of the network and to this device: signs
+/// a write grant for each and stores it, so the list may be written and sent to them.
+/// Only a device that can admit members (network key or delegation) can do this.
+pub fn grant_shared_list(ctx: &PairingContext<'_>, list_id: &str) -> Result<(), String> {
+    let now = Utc::now().timestamp();
+    let our_b64 = public_key_to_base64(ctx.device_key.verifying_key().as_bytes());
+    let our_ovlast = load_active_ovlast(ctx.conn, ctx.network_pub, &our_b64, now)?;
+    let network_b64 = public_key_to_base64(ctx.network_pub.as_bytes());
+    let signer = match ctx.network_key {
+        Some(root_sk) => (network_b64.as_str(), root_sk),
+        None if our_ovlast.is_some() => (our_b64.as_str(), ctx.device_key),
+        None => {
+            return Err("Zajednicki popis moze stvoriti samo uredjaj koji upravlja mrezom".into());
+        }
+    };
+    let validity = Validity {
+        issued_at: now,
+        valid_for_secs: DEFAULT_MEMBERSHIP_VALIDITY_SECS,
+    };
+    let mut recipients = vec![our_b64.clone()];
+    let mut stmt = ctx
+        .conn
+        .prepare(
+            "SELECT DISTINCT subject_key FROM sync_trust_records
+             WHERE kind = 'membership' AND revoked = 0",
+        )
+        .map_err(|e| e.to_string())?;
+    for key in stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+    {
+        let key = key.map_err(|e| e.to_string())?;
+        if !recipients.contains(&key)
+            && key != network_b64
+            && !crate::acl::revoked(ctx.conn, "membership", &key, "")?
+        {
+            recipients.push(key);
+        }
+    }
+    for recipient in recipients {
+        let vk = parse_public_key(&recipient).map_err(|e| e.to_string())?;
+        let Some((grant, version)) =
+            sign_list_grant(ctx, our_ovlast.as_ref(), signer, &vk, list_id, validity)?
+        else {
+            continue;
+        };
+        store_control_record(
+            ctx.conn,
+            ctx.network_pub,
+            &ControlPayload::ListGrant(grant),
+            now,
+        )?;
+        insert_control_version_if_missing(ctx.conn, &version)?;
+    }
+    Ok(())
 }
 
 fn build_in_memory_control_version(
@@ -849,6 +1036,17 @@ pub fn finalize_pairing_in_db(
         }
         for cv in &theirs.control_versions {
             insert_control_version_if_missing(&tx, cv)?;
+        }
+        // The trust cache answers "may this author write here"; fill it from the history,
+        // oldest first, as receiving it in a conversation would. A record that no longer
+        // holds today (expired or revoked) is skipped here but its signed version stays,
+        // so it can still prove what was written while it held.
+        let mut history: Vec<&Version> = theirs.control_versions.iter().collect();
+        history.sort_by(|a, b| a.version_id.cmp(&b.version_id));
+        for cv in history {
+            if let Ok(ctrl) = serde_json::from_str::<ControlPayload>(&cv.payload) {
+                let _ = store_control_record(&tx, &new_net_vk, &ctrl, now);
+            }
         }
 
         if my_role_rec.role == MemberRole::OwnDevice {

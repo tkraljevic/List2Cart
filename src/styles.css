@@ -1309,3 +1309,75 @@ input[type="checkbox"] {
 .commerce-list-card strong { font-size: 20px; }
 .commerce-list-preview { overflow-wrap: anywhere; line-height: 1.5; }
 @media (max-width: 768px) { .commerce-lists { grid-template-columns: 1fr; } }
+
+/* Suggestions under the list's add field */
+.quick-find {
+  margin-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 10px;
+  display: grid;
+  gap: 6px;
+}
+.qf-head {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+.qf-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-card-subtle);
+}
+.qf-row .item-copy {
+  flex: 1;
+  min-width: 0;
+}
+.qf-price {
+  display: grid;
+  justify-items: end;
+  white-space: nowrap;
+}
+.qf-add {
+  min-width: 44px;
+  min-height: 44px;
+  font-size: 20px;
+  line-height: 1;
+}
+.qf-actions {
+  align-items: center;
+}
+.branch-picks .field {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+.branch-picks select {
+  width: 100%;
+  max-width: 100%;
+}
+
+/* Shared lists */
+.list-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--primary-subtle);
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 600;
+  vertical-align: middle;
+}
+.shared-toggle {
+  display: grid;
+  gap: 2px;
+  align-self: center;
+}
+.shared-toggle input {
+  margin-right: 6px;
+}

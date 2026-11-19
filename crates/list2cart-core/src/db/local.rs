@@ -1028,10 +1028,13 @@ impl Database {
         })
     }
 
+    /// A shared list lives on its own `list:<id>` channel, open to every member of the
+    /// network (family members included); a private one on this person's channel.
     pub(super) fn local_create_list(
         &self,
         name: &str,
         store_id: Option<i64>,
+        shared: bool,
     ) -> Result<ShoppingList, String> {
         if name.trim().is_empty() {
             return Err("Naziv popisa je prazan".into());
@@ -1043,7 +1046,14 @@ impl Database {
         if let Some(sid) = store_id {
             ensure_active(&tx, "stores", sid)?;
         }
-        self.record_snapshot(&tx, "shopping_lists", &id)?;
+        if shared {
+            // The grants share this transaction: no list without them, nor the reverse.
+            let network_name = self.network_name()?;
+            crate::pairing_session::grant_shared_list(&self.pairing_context(&network_name), &id)?;
+            self.record_snapshot_on(&tx, "shopping_lists", &id, Some(&format!("list:{id}")))?;
+        } else {
+            self.record_snapshot(&tx, "shopping_lists", &id)?;
+        }
         tx.commit().map_err(sql_error)?;
         self.list_shopping_lists()?
             .into_iter()
@@ -1226,8 +1236,22 @@ impl Database {
         entity: &str,
         id: &str,
     ) -> Result<Version, String> {
+        self.record_snapshot_on(conn, entity, id, None)
+    }
+
+    /// Records a signed version; `channel` places a new record, otherwise the
+    /// record keeps the channel of its earlier versions (or its parent list's).
+    fn record_snapshot_on(
+        &self,
+        conn: &Connection,
+        entity: &str,
+        id: &str,
+        channel: Option<&str>,
+    ) -> Result<Version, String> {
         let (payload, archived) = snapshot(conn, entity, id)?;
-        let channel = if entity == "planned_items" {
+        let channel = if let Some(channel) = channel {
+            channel.to_owned()
+        } else if entity == "planned_items" {
             let parent:String=conn.query_row("SELECT sl.sync_id FROM planned_items pi JOIN shopping_lists sl ON sl.id=pi.list_id WHERE pi.sync_id=?1",[id],|r|r.get(0)).map_err(sql_error)?;
             self.channel_for(conn, "shopping_lists", &parent)?
         } else {

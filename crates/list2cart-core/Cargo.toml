@@ -10,6 +10,8 @@ chrono = { version = "0.4", features = ["serde"] }
 csv = "1"
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 encoding_rs = "0.8"
+flate2 = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
 syncnet = { version = "0.0.1", git = "https://github.com/tkraljevic/syncnet", rev = "38459854f34848eecddfc8b74ee74acd579db352" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -22,3 +24,6 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+
+[dev-dependencies]
+zip = { version = "9", default-features = false, features = ["deflate"] }

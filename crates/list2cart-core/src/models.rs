@@ -122,6 +122,9 @@ pub struct ShoppingList {
     pub items: Vec<PlannedItem>,
     pub total_estimated_cents: i64,
     pub updated_at: String,
+    /// Seen and edited by every member of the network, family members included.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
