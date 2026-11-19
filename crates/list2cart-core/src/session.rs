@@ -1442,4 +1442,177 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn sharing_a_private_list_and_stopping_again_keeps_its_items_on_every_device() {
+        let d = three_devices();
+        sync_pair(&d.owner, &d.own).await.unwrap();
+        sync_pair(&d.owner, &d.family).await.unwrap();
+        let private = {
+            let owner = d.owner.lock().unwrap();
+            let list = owner.create_shopping_list("Tjedna", None).unwrap();
+            owner
+                .add_planned_item(list.id, None, "Kruh", 1.0, Unit::Kom, 199)
+                .unwrap();
+            let eggs = owner
+                .add_planned_item(list.id, None, "Jaja", 1.0, Unit::Kom, 250)
+                .unwrap();
+            owner.toggle_planned_item(eggs.id, true).unwrap();
+            list
+        };
+
+        // Sharing: a shared copy with the same items and marks; the private one is archived.
+        let shared = d
+            .owner
+            .lock()
+            .unwrap()
+            .share_shopping_list(private.id)
+            .unwrap();
+        assert!(shared.shared);
+        assert_eq!(shared.name, "Tjedna");
+        let marks: Vec<(String, bool)> = shared
+            .items
+            .iter()
+            .map(|i| (i.name.clone(), i.checked))
+            .collect();
+        assert_eq!(
+            marks,
+            [("Kruh".to_owned(), false), ("Jaja".to_owned(), true)]
+        );
+        assert!(
+            !d.owner
+                .lock()
+                .unwrap()
+                .list_shopping_lists()
+                .unwrap()
+                .iter()
+                .any(|l| l.sync_id == private.sync_id)
+        );
+        sync_pair(&d.owner, &d.family).await.unwrap();
+        sync_pair(&d.owner, &d.own).await.unwrap();
+        add_item(&d.family, &shared.sync_id, "Mlijeko").unwrap();
+        sync_pair(&d.owner, &d.family).await.unwrap();
+        sync_pair(&d.owner, &d.own).await.unwrap();
+        for db in [&d.owner, &d.own, &d.family] {
+            assert_eq!(items_of(db, &shared.sync_id), ["Jaja", "Kruh", "Mlijeko"]);
+        }
+        // Only a device that grants rights can share.
+        let refused = {
+            let family = d.family.lock().unwrap();
+            let id = family
+                .list_shopping_lists()
+                .unwrap()
+                .into_iter()
+                .find(|l| l.sync_id == shared.sync_id)
+                .unwrap()
+                .id;
+            family.unshare_shopping_list(id)
+        };
+        assert!(
+            refused
+                .unwrap_err()
+                .contains("samo uredjaj koji upravlja mrezom")
+        );
+
+        // Stopping: the shared list is archived, its items written over the original.
+        let back = {
+            let owner = d.owner.lock().unwrap();
+            let id = owner
+                .list_shopping_lists()
+                .unwrap()
+                .into_iter()
+                .find(|l| l.sync_id == shared.sync_id)
+                .unwrap()
+                .id;
+            owner.unshare_shopping_list(id).unwrap()
+        };
+        assert_eq!(
+            back.sync_id, private.sync_id,
+            "the original private list is back"
+        );
+        assert!(!back.shared);
+        sync_pair(&d.owner, &d.family).await.unwrap();
+        sync_pair(&d.owner, &d.own).await.unwrap();
+        for db in [&d.owner, &d.own] {
+            assert_eq!(items_of(db, &private.sync_id), ["Jaja", "Kruh", "Mlijeko"]);
+            assert_eq!(list_names(db).iter().filter(|n| *n == "Tjedna").count(), 1);
+        }
+        assert_eq!(
+            list_names(&d.owner),
+            ["Tjedna", "Zajednicki"],
+            "the shared copy is gone, the private one is back"
+        );
+        assert_eq!(
+            list_names(&d.family),
+            ["Zajednicki"],
+            "the family member no longer sees the list"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_lists_reaches_other_devices_and_a_shared_one_only_from_the_owner() {
+        let d = three_devices();
+        sync_pair(&d.owner, &d.own).await.unwrap();
+        sync_pair(&d.owner, &d.family).await.unwrap();
+        let id_on = |db: &Arc<Mutex<Database>>, sync_id: &str| {
+            db.lock()
+                .unwrap()
+                .list_shopping_lists()
+                .unwrap()
+                .into_iter()
+                .find(|l| l.sync_id == sync_id)
+                .unwrap()
+                .id
+        };
+        // A family member deletes their own list, but not the shared one.
+        let mine = d
+            .family
+            .lock()
+            .unwrap()
+            .create_shopping_list("Moj", None)
+            .unwrap();
+        d.family
+            .lock()
+            .unwrap()
+            .delete_shopping_list(mine.id)
+            .unwrap();
+        assert_eq!(list_names(&d.family), ["Zajednicki"]);
+        let shared_on_family = id_on(&d.family, &d.shared_list);
+        let refused = d
+            .family
+            .lock()
+            .unwrap()
+            .delete_shopping_list(shared_on_family);
+        assert!(
+            refused
+                .unwrap_err()
+                .contains("samo uredjaj koji upravlja mrezom")
+        );
+
+        // The owner's deletions reach the owner's other device and the family member.
+        let private = d
+            .owner
+            .lock()
+            .unwrap()
+            .create_shopping_list("Stari", None)
+            .unwrap();
+        sync_pair(&d.owner, &d.own).await.unwrap();
+        assert!(list_names(&d.own).contains(&"Stari".to_owned()));
+        d.owner
+            .lock()
+            .unwrap()
+            .delete_shopping_list(private.id)
+            .unwrap();
+        let shared_id = id_on(&d.owner, &d.shared_list);
+        d.owner
+            .lock()
+            .unwrap()
+            .delete_shopping_list(shared_id)
+            .unwrap();
+        sync_pair(&d.owner, &d.own).await.unwrap();
+        sync_pair(&d.owner, &d.family).await.unwrap();
+        for db in [&d.owner, &d.own, &d.family] {
+            assert!(list_names(db).is_empty(), "{:?}", list_names(db));
+        }
+    }
 }

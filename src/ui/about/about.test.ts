@@ -35,4 +35,12 @@ describe("renderAbout", () => {
     expect(html).not.toContain("<script>");
     expect(html).toContain('data-goto="sync"');
   });
+
+  test("offers Ko-fi only when a support link is given", () => {
+    const base = { name: "List2Cart", version: "1", license: "EUPL-1.2", iconUrl: "/i.png" };
+    const withLink = renderAbout({ ...base, supportUrl: "https://ko-fi.com/tkraljevic" }, helpers);
+    expect(withLink).toContain('href="https://ko-fi.com/tkraljevic"');
+    expect(withLink).toContain("Podržite razvoj");
+    expect(renderAbout({ ...base, supportUrl: null }, helpers)).not.toContain("ko-fi");
+  });
 });

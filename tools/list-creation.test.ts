@@ -8,6 +8,7 @@ test("creation surfaces denied private access without attempting a refresh",asyn
  expect(refreshed).toBe(false);
  expect(listCreationError("Privatni kanal dopusten je iskljucivo")).toContain("Povežite ga ponovno");
  expect(listCreationError("Zajednicki popis moze stvoriti samo uredjaj koji upravlja mrezom")).toContain("uređaj koji upravlja mrežom");
+ expect(listCreationError("Dijeliti popise moze samo uredjaj koji upravlja mrezom")).toBe("Dijeliti popise može samo uređaj koji upravlja mrežom.");
 });
 test("failed list refresh preserves confirmed create and never creates a duplicate",async()=>{
  let calls=0;

@@ -1036,29 +1036,203 @@ impl Database {
         store_id: Option<i64>,
         shared: bool,
     ) -> Result<ShoppingList, String> {
+        let tx = self.conn.unchecked_transaction().map_err(sql_error)?;
+        let (_, id) = self.insert_list_in(&tx, name, store_id, shared)?;
+        tx.commit().map_err(sql_error)?;
+        self.find_list(&id)
+    }
+
+    fn find_list(&self, sync_id: &str) -> Result<ShoppingList, String> {
+        self.list_shopping_lists()?
+            .into_iter()
+            .find(|l| l.sync_id == sync_id)
+            .ok_or("Popis nije pronadjen nakon upisa".into())
+    }
+
+    /// Inserts and signs a new list in the caller's transaction; returns its row and sync ID.
+    fn insert_list_in(
+        &self,
+        tx: &Connection,
+        name: &str,
+        store_id: Option<i64>,
+        shared: bool,
+    ) -> Result<(i64, String), String> {
         if name.trim().is_empty() {
             return Err("Naziv popisa je prazan".into());
         }
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
-        let tx = self.conn.unchecked_transaction().map_err(sql_error)?;
         tx.execute("INSERT INTO shopping_lists(sync_id,name,store_id,store_sync_id,updated_at) VALUES (?1,?2,?3,(SELECT sync_id FROM stores WHERE id=?3 AND archived=0),?4)",params![id,name.trim(),store_id,now]).map_err(sql_error)?;
+        let row = tx.last_insert_rowid();
         if let Some(sid) = store_id {
-            ensure_active(&tx, "stores", sid)?;
+            ensure_active(tx, "stores", sid)?;
         }
         if shared {
             // The grants share this transaction: no list without them, nor the reverse.
             let network_name = self.network_name()?;
             crate::pairing_session::grant_shared_list(&self.pairing_context(&network_name), &id)?;
-            self.record_snapshot_on(&tx, "shopping_lists", &id, Some(&format!("list:{id}")))?;
+            self.record_snapshot_on(tx, "shopping_lists", &id, Some(&format!("list:{id}")))?;
         } else {
-            self.record_snapshot(&tx, "shopping_lists", &id)?;
+            self.record_snapshot(tx, "shopping_lists", &id)?;
+        }
+        Ok((row, id))
+    }
+
+    /// Shares a private list or stops sharing a shared one. A record cannot move
+    /// between a person's private part and a shared list (ADR-002), so the list is
+    /// copied with its items and "bought" marks, and the old one is archived.
+    /// Sharing remembers the private original on this device; stopping writes the
+    /// shared list's items over that original and brings it back from the archive.
+    pub(super) fn local_set_list_shared(
+        &self,
+        list_id: i64,
+        shared: bool,
+    ) -> Result<ShoppingList, String> {
+        if !self.can_admit_members()? {
+            return Err("Dijeliti popise moze samo uredjaj koji upravlja mrezom".into());
+        }
+        let tx = self.conn.unchecked_transaction().map_err(sql_error)?;
+        let (sync_id, name, store_id, archived): (String, String, Option<i64>, bool) = tx
+            .query_row(
+                "SELECT sync_id,name,store_id,archived FROM shopping_lists WHERE id=?1",
+                [list_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(sql_error)?;
+        if archived {
+            return Err("Popis je arhiviran".into());
+        }
+        let is_shared = self
+            .channel_for(&tx, "shopping_lists", &sync_id)?
+            .starts_with("list:");
+        if is_shared == shared {
+            return Err(if shared {
+                "Popis je vec zajednicki"
+            } else {
+                "Popis nije zajednicki"
+            }
+            .into());
+        }
+        let items = list_items_for_copy(&tx, list_id)?;
+        let (target, target_sync) = if shared {
+            let (row, new_id) = self.insert_list_in(&tx, &name, store_id, true)?;
+            tx.execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![origin_key(&new_id), sync_id],
+            )
+            .map_err(sql_error)?;
+            (row, new_id)
+        } else {
+            let origin: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT sl.id, sl.sync_id FROM settings s JOIN shopping_lists sl ON sl.sync_id = s.value
+                     WHERE s.key = ?1",
+                    [origin_key(&sync_id)],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            match origin {
+                Some((row, origin_id))
+                    if !self
+                        .channel_for(&tx, "shopping_lists", &origin_id)?
+                        .starts_with("list:") =>
+                {
+                    let old_items = string_rows(
+                        &tx,
+                        &format!(
+                            "SELECT sync_id FROM planned_items WHERE list_id={row} AND archived=0"
+                        ),
+                    )?;
+                    for item in old_items {
+                        self.set_archived_in(&tx, "planned_items", &item, true)?;
+                    }
+                    tx.execute(
+                        "UPDATE shopping_lists SET name=?1, store_id=?2,
+                         store_sync_id=(SELECT sync_id FROM stores WHERE id=?2 AND archived=0),
+                         archived=0, updated_at=?3 WHERE id=?4",
+                        params![name, store_id, Utc::now().to_rfc3339(), row],
+                    )
+                    .map_err(sql_error)?;
+                    self.record_snapshot(&tx, "shopping_lists", &origin_id)?;
+                    (row, origin_id)
+                }
+                _ => self.insert_list_in(&tx, &name, store_id, false)?,
+            }
+        };
+        self.insert_item_copies(&tx, target, &target_sync, &items)?;
+        self.set_archived_in(&tx, "shopping_lists", &sync_id, true)?;
+        if !shared {
+            tx.execute("DELETE FROM settings WHERE key=?1", [origin_key(&sync_id)])
+                .map_err(sql_error)?;
         }
         tx.commit().map_err(sql_error)?;
-        self.list_shopping_lists()?
-            .into_iter()
-            .find(|l| l.sync_id == id)
-            .ok_or("Popis nije pronadjen nakon upisa".into())
+        self.find_list(&target_sync)
+    }
+
+    /// Deletes a list for every device that has it. A shared list disappears for
+    /// the whole family, so only a device that manages the network may delete it.
+    /// Like every deletion that has to reach other devices, it is an archive.
+    pub(super) fn local_delete_list(&self, list_id: i64) -> Result<(), String> {
+        let tx = self.conn.unchecked_transaction().map_err(sql_error)?;
+        let (sync_id, archived): (String, bool) = tx
+            .query_row(
+                "SELECT sync_id,archived FROM shopping_lists WHERE id=?1",
+                [list_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(sql_error)?;
+        if archived {
+            return Err("Popis je vec obrisan".into());
+        }
+        let shared = self
+            .channel_for(&tx, "shopping_lists", &sync_id)?
+            .starts_with("list:");
+        if shared && !self.can_admit_members()? {
+            return Err("Zajednicki popis moze obrisati samo uredjaj koji upravlja mrezom".into());
+        }
+        self.set_archived_in(&tx, "shopping_lists", &sync_id, true)?;
+        tx.execute("DELETE FROM settings WHERE key=?1", [origin_key(&sync_id)])
+            .map_err(sql_error)?;
+        tx.commit().map_err(sql_error)
+    }
+
+    fn insert_item_copies(
+        &self,
+        tx: &Connection,
+        list_id: i64,
+        list_sync_id: &str,
+        items: &[ItemCopy],
+    ) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        for item in items {
+            let id = Uuid::new_v4().to_string();
+            tx.execute("INSERT INTO planned_items(sync_id,list_id,list_sync_id,barcode,name,quantity,unit,estimated_price_cents,checked,updated_at)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![id,list_id,list_sync_id,item.barcode,item.name,item.quantity,item.unit,item.price,item.checked,now]).map_err(sql_error)?;
+            self.record_snapshot(tx, "planned_items", &id)?;
+        }
+        self.touch_list(tx, list_id, &now)
+    }
+
+    /// Archives or restores one record in the caller's transaction.
+    fn set_archived_in(
+        &self,
+        tx: &Connection,
+        table: &str,
+        sync_id: &str,
+        archived: bool,
+    ) -> Result<(), String> {
+        let n = tx
+            .execute(
+                &format!("UPDATE {table} SET archived=?1, updated_at=?2 WHERE sync_id=?3"),
+                params![archived, Utc::now().to_rfc3339(), sync_id],
+            )
+            .map_err(sql_error)?;
+        if n != 1 {
+            return Err("Zapis za arhiviranje nije pronadjen".into());
+        }
+        self.record_snapshot(tx, table, sync_id)?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)] // Existing domain command: caller supplies a complete planned item.
@@ -1410,3 +1584,40 @@ fn snapshot(conn: &Connection, entity: &str, id: &str) -> Result<(String, bool),
 
 #[cfg(test)]
 mod tests;
+
+/// An item as it is copied when a list is shared or stops being shared.
+struct ItemCopy {
+    barcode: Option<String>,
+    name: String,
+    quantity: f64,
+    unit: String,
+    price: i64,
+    checked: bool,
+}
+
+fn list_items_for_copy(conn: &Connection, list_id: i64) -> Result<Vec<ItemCopy>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT barcode,name,quantity,unit,estimated_price_cents,checked FROM planned_items
+             WHERE list_id=?1 AND archived=0 ORDER BY id",
+        )
+        .map_err(sql_error)?;
+    let rows = stmt
+        .query_map([list_id], |r| {
+            Ok(ItemCopy {
+                barcode: r.get(0)?,
+                name: r.get(1)?,
+                quantity: r.get(2)?,
+                unit: r.get(3)?,
+                price: r.get(4)?,
+                checked: r.get(5)?,
+            })
+        })
+        .map_err(sql_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(sql_error)
+}
+
+/// Local setting that remembers which private list a shared list was copied from.
+fn origin_key(shared_list_sync_id: &str) -> String {
+    format!("shared_list_origin:{shared_list_sync_id}")
+}

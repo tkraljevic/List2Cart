@@ -48,3 +48,9 @@ Test s tri uređaja u istoj mreži (vlasnik, njegov drugi uređaj, član obitelj
 4. **Obiteljski prijenos smije donijeti grant koji primatelj još nije vidio.** Početna provjera prijenosa (`only_unseen_grants`) propušta kanal `list:<id>` samo ako za tu stranu i taj popis lokalno ne postoji nikakav zapis o grantu. Grant koji je primatelj već vidio pa izgubio (opoziv, istek) i dalje odbija prijenos, a puna provjera ponavlja se nakon primjene dokaza.
 
 Testovi: `owner_and_own_device_use_the_app_and_see_each_others_lists_and_receipts`, `family_member_uses_the_app_privately_and_shares_only_the_shared_list` i `a_list_shared_after_pairing_reaches_every_member_and_only_the_owner_can_share` u `session.rs`.
+
+### Dijeljenje postojećeg popisa i brisanje (2026-11-19)
+
+5. **„Podijeli s obitelji”** napravi zajednički popis s istim nazivom, trgovinom i artiklima (sa stanjem „kupljeno”) i arhivira privatni izvornik; uređaj lokalno pamti od kojeg je popisa kopija nastala. **„Prestani dijeliti”** arhivira zajednički popis i prepiše njegove artikle preko tog izvornika, koji vraća iz arhive (ili napravi novi privatni popis). Oboje smije samo uređaj koji izdaje grantove.
+6. Prestanak dijeljenja **ne opoziva** grantove: opozvani član više ne bi primio ni arhiviranje, pa bi mu popis ostao vidljiv, a opoziv bi odbacio i ranije neisporučene izmjene tog popisa.
+7. **Brisanje** popisa je arhiviranje, kao i svako brisanje koje mora stići do drugih uređaja. Privatni popis briše njegov vlasnik (i član obitelji svoj), zajednički samo uređaj koji izdaje grantove, jer nestaje svima.

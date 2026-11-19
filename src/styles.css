@@ -1381,3 +1381,20 @@ input[type="checkbox"] {
 .shared-toggle input {
   margin-right: 6px;
 }
+/* A long branch name must not widen the page: the field's column may shrink. */
+.branch-picks .field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+.delete-confirm {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  background: var(--danger-bg);
+}
+/* A link styled as a button (Ko-fi) reads like the other buttons. */
+a.btn {
+  text-decoration: none;
+  justify-content: center;
+}

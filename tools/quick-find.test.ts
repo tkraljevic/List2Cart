@@ -98,3 +98,8 @@ test("branch names drop the price list date and time",()=>{
  expect(branchName("diskontna prodavaonica-310002-I Štefanovecki zavoj 12-Zagreb-10000-310002191126-19.11.2026-7.30.csv")).toBe("diskontna prodavaonica-310002-I Štefanovecki zavoj 12-Zagreb-10000-310002191126");
  expect(branchName("hipermarket zagreb avenija v. holjevca 62 8717 interspar 8717 zg buzin 0567 20261119 0330.csv")).toBe("hipermarket zagreb avenija v. holjevca 62 8717 interspar 8717 zg buzin 0567");
 });
+test("a chain with one price list for every shop is offered in every town",()=>{
+ const all:ChainSources[]=[{chain:"dm",error:null,sources:[{chain:"dm",label:"Sve poslovnice (iste cijene)",url:"https://api.cijene.dev/x#dm/all",price_date:"2026-11-19",branch_key:"dm:all",postal_code:null}]}];
+ expect(branchesNear(all,"31000").get("dm")!.length).toBe(1);
+ expect(branchesNear(all,"Osijek").get("dm")!.length).toBe(1);
+});

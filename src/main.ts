@@ -5,6 +5,7 @@ import {
   requestPermissions as requestBarcodePermissions,
   scan as scanNativeBarcode,
 } from "@tauri-apps/plugin-barcode-scanner";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   addNetworkMember,
   retailSources,
@@ -25,9 +26,13 @@ import {
   calcLineCents,
   confirmPairPeer,
   createShoppingList,
+  setListShared,
+  deleteShoppingList,
   dialPairPeer,
   discoverLanPeers,
   exportReceiptXlsx,
+  exportListXlsx,
+  exportReceiptsXlsx,
   exportSyncBundleJson,
   formatCents,
   getLanStatus,
@@ -205,6 +210,10 @@ interface AppModel {
   draftNewListShared: boolean;
   /** This device can share lists: it holds the network key or a delegation. */
   canShareLists: boolean;
+  /** Sharing or unsharing the open list is in progress. */
+  shareBusy: boolean;
+  /** The list whose deletion waits for a second click. */
+  confirmDeleteListId: number | null;
   selectedReceipt: ReceiptSummary | null;
   receiptSearch: string;
   receiptStore: string;
@@ -282,6 +291,8 @@ const model: AppModel = {
   draftNewListStoreId: null,
   draftNewListShared: false,
   canShareLists: false,
+  shareBusy: false,
+  confirmDeleteListId: null,
   selectedReceipt: null,
   receiptSearch: "",
   receiptStore: "",
@@ -651,15 +662,33 @@ function renderPlaner(): string {
         ${items.length ? items.map(item => `<div class="plan-row ${item.checked ? "is-checked" : ""}"><label class="row grow"><input type="checkbox" data-toggle-plan="${item.id}" ${item.checked ? "checked" : ""} /><span class="item-copy"><span class="item-title">${escapeHtml(item.name)}</span><span class="item-sub">${formatQuantity(item.quantity)} ${item.unit === "l" ? "L" : item.unit}</span></span></label><span class="item-price">${escapeHtml(formatCents(lineTotal(item)))}</span><button class="icon-button btn-danger-ghost no-print" type="button" data-remove-plan="${escapeHtml(item.sync_id)}" aria-label="Ukloni ${escapeHtml(item.name)}">${icon("close")}</button></div>`).join("") : '<div class="empty-state"><h2>Što trebate kupiti?</h2><p>Dodajte prvi artikl na ovaj popis.</p></div>'}
       </section><section class="card plan-summary"><div class="row space-between"><span class="item-sub">Preostalo · ${remaining.length} artikala</span><strong class="checkout-total">${escapeHtml(formatCents(remainingTotal))}</strong></div>
         <button class="btn btn-primary" id="btn-transfer-cart" ${remaining.length ? "" : "disabled"}>Kreni u kupnju</button><p class="item-sub">Preostali artikli dodaju se u košaricu s unesenim procjenama cijena.</p><button class="text-button" data-goto="cijene">Usporedi cijene popisa →</button><button class="text-button no-print" data-toggle-retail>Pronađi artikl u cjeniku</button>
+        <button class="text-button no-print" id="btn-export-list" ${items.length ? "" : "disabled"}>Izvezi u Excel</button>
+        ${canShareLists() ? `<button class="text-button no-print" id="btn-toggle-shared" ${model.shareBusy ? "disabled" : ""}>${list.shared ? "Prestani dijeliti" : "Podijeli s obitelji"}</button><p class="item-sub">${list.shared ? "Popis vide i uređuju svi članovi obitelji. Ako prestaneš dijeliti, vraća se među tvoje privatne popise sa svim artiklima." : "Popis će vidjeti i uređivati svi članovi obitelji."}</p>` : ""}
+        ${!list.shared || canShareLists() ? (model.confirmDeleteListId === list.id
+          ? `<div class="delete-confirm" id="delete-list-confirm" role="alert"><p>Sigurno obrisati „${escapeHtml(list.name)}”?${list.shared ? " Nestat će i svim članovima obitelji." : ""}</p><div class="row-wrap"><button class="btn btn-danger" id="btn-delete-list-confirm">Obriši popis</button><button class="btn btn-outline" id="btn-delete-list-cancel">Odustani</button></div></div>`
+          : `<button class="text-button btn-danger-ghost no-print" id="btn-delete-list">Obriši popis</button>`) : ""}
       </section></div>` : `<section class="card empty-state">${icon("planer")}<h2>Vaš prvi popis za kupnju</h2><p>Odaberite Novi popis i zapišite što trebate.</p></section>`}`;
+}
+
+/** The receipts the Računi view shows for its search and store filter. */
+function visibleReceipts(): ReceiptSummary[] {
+  const query = model.receiptSearch.trim().toLocaleLowerCase("hr");
+  return model.receipts.filter(r => (!model.receiptStore || r.store_name === model.receiptStore)
+    && `${r.store_name} ${r.items.map(i => i.name).join(" ")} ${formatDate(r.created_at)}`.toLocaleLowerCase("hr").includes(query));
+}
+
+/** What the export holds, in words, for the top of the spreadsheet. */
+function receiptSelectionText(): string {
+  const parts = [model.receiptStore || "Sve trgovine"];
+  if (model.receiptSearch.trim()) parts.push(`pretraga „${model.receiptSearch.trim()}”`);
+  return parts.join(", ");
 }
 
 function renderReceipts(): string {
   const query = model.receiptSearch.trim().toLocaleLowerCase("hr");
-  const receipts = model.receipts.filter(r => (!model.receiptStore || r.store_name === model.receiptStore)
-    && `${r.store_name} ${r.items.map(i => i.name).join(" ")} ${formatDate(r.created_at)}`.toLocaleLowerCase("hr").includes(query));
+  const receipts = visibleReceipts();
   const total = receipts.reduce((sum, r) => sum + r.receipt_total_cents, 0);
-  return `${pageHeader("Računi", "Povijest kupnje i spremljene stavke na jednom mjestu.")}
+  return `${pageHeader("Računi", "Povijest kupnje i spremljene stavke na jednom mjestu.", `<button class="btn btn-outline no-print" id="btn-export-receipts" ${receipts.length ? "" : "disabled"}>Izvezi u Excel</button>`)}
     <div class="receipt-filters no-print"><input id="receipt-search" aria-label="Pretraži račune" placeholder="Trgovina, artikl ili datum…" value="${escapeHtml(model.receiptSearch)}" /><select id="receipt-store" aria-label="Filtriraj račune po trgovini"><option value="">Sve trgovine</option>${[...new Set(model.receipts.map(r => r.store_name))].map(name => `<option ${model.receiptStore === name ? "selected" : ""} value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")}</select></div>
     <section class="card receipt-summary"><div><span class="item-sub">${receipts.length} spremljenih računa${query || model.receiptStore ? " u odabiru" : ""}</span><div class="big-stat">${escapeHtml(formatCents(total))}</div></div><p class="item-sub">Zbroj unesenih iznosa računa.</p></section>
     <div class="receipt-list">${receipts.length ? receipts.map(r => `<button class="card receipt-card" data-receipt-id="${r.id}"><div class="receipt-icon">${icon("racuni")}</div><div class="item-copy"><strong>${escapeHtml(r.store_name)}</strong><span class="item-sub">${escapeHtml(formatDate(r.created_at))} · ${r.items.length} stavki</span><span class="item-sub">${r.difference_cents === 0 ? "Zbroj se podudara" : `Razlika ${escapeHtml(formatCents(r.difference_cents))}`}</span></div><div class="receipt-amount"><strong>${escapeHtml(formatCents(r.receipt_total_cents))}</strong><span class="item-sub">Otvori račun →</span></div></button>`).join("") : `<section class="card empty-state">${icon("racuni")}<h2>${model.receipts.length ? "Nema računa za ovaj odabir" : "Još nema spremljenih računa"}</h2><p>${model.receipts.length ? "Promijenite pretragu ili trgovinu." : "Nakon kupnje spremite račun iz košarice."}</p><button class="btn btn-outline" data-goto="kosarica">Otvori kupnju</button></section>`}</div>`;
@@ -1820,6 +1849,70 @@ function bindEvents(): void {
   if (newListStore) newListStore.onchange = () => {
     model.draftNewListStoreId = newListStore.value ? Number(newListStore.value) : null;
   };
+  const exportTarget = currentList();
+  const btnExportList = document.getElementById("btn-export-list") as HTMLButtonElement | null;
+  if (btnExportList && exportTarget) btnExportList.onclick = async () => {
+    btnExportList.disabled = true;
+    try {
+      showToast(`Excel spremljen: ${await exportListXlsx(exportTarget.id)}`);
+    } catch (error) {
+      showToast(`Excel izvoz nije uspio: ${error}`);
+    } finally {
+      btnExportList.disabled = false;
+    }
+  };
+  const deleteTarget = currentList();
+  const btnDeleteList = document.getElementById("btn-delete-list");
+  if (btnDeleteList && deleteTarget) btnDeleteList.onclick = () => {
+    model.confirmDeleteListId = deleteTarget.id;
+    render();
+    // A full render starts at the top; keep the question where it was asked.
+    document.getElementById("delete-list-confirm")?.scrollIntoView({ block: "nearest" });
+  };
+  const btnDeleteCancel = document.getElementById("btn-delete-list-cancel");
+  if (btnDeleteCancel) btnDeleteCancel.onclick = () => {
+    model.confirmDeleteListId = null;
+    render();
+  };
+  const btnDeleteConfirm = document.getElementById("btn-delete-list-confirm") as HTMLButtonElement | null;
+  if (btnDeleteConfirm && deleteTarget) btnDeleteConfirm.onclick = async () => {
+    btnDeleteConfirm.disabled = true;
+    try {
+      await deleteShoppingList(deleteTarget.id);
+      model.confirmDeleteListId = null;
+      model.selectedListId = null;
+      model.lists = await listShoppingLists();
+      render();
+      showToast(`Popis „${deleteTarget.name}” je obrisan.`);
+    } catch (error) {
+      model.confirmDeleteListId = null;
+      render();
+      showToast(`Popis nije obrisan: ${listCreationError(error).replace(/^Popis nije spremljen: /, "")}`);
+    }
+  };
+  const btnToggleShared = document.getElementById("btn-toggle-shared");
+  const sharedTarget = currentList();
+  if (btnToggleShared && sharedTarget) {
+    btnToggleShared.onclick = async () => {
+      if (model.shareBusy) return;
+      const share = !sharedTarget.shared;
+      model.shareBusy = true;
+      render();
+      try {
+        const result = await setListShared(sharedTarget.id, share);
+        model.selectedListId = result.id;
+        model.lists = await listShoppingLists();
+        showToast(share
+          ? `Popis „${result.name}” sad vide svi članovi obitelji.`
+          : `Popis „${result.name}” više nije zajednički i vraćen je među tvoje popise.`);
+      } catch (error) {
+        showToast(`${share ? "Popis nije podijeljen" : "Dijeljenje nije prekinuto"}: ${listCreationError(error).replace(/^Popis nije spremljen: /, "")}`);
+      } finally {
+        model.shareBusy = false;
+        render();
+      }
+    };
+  }
   const newListShared = document.getElementById("chk-list-shared") as HTMLInputElement | null;
   if (newListShared) newListShared.onchange = () => {
     model.draftNewListShared = newListShared.checked;
@@ -1984,6 +2077,20 @@ function bindEvents(): void {
     };
   }
 
+  const btnExportReceipts = document.getElementById("btn-export-receipts") as HTMLButtonElement | null;
+  if (btnExportReceipts) btnExportReceipts.onclick = async () => {
+    const receipts = visibleReceipts();
+    if (!receipts.length) return;
+    btnExportReceipts.disabled = true;
+    try {
+      const path = await exportReceiptsXlsx(receipts.map(r => r.id), receiptSelectionText());
+      showToast(`Excel s ${receipts.length} ${receipts.length === 1 ? "računom" : "računa"} spremljen: ${path}`);
+    } catch (error) {
+      showToast(`Excel izvoz nije uspio: ${error}`);
+    } finally {
+      btnExportReceipts.disabled = false;
+    }
+  };
   const receiptStoreSel = document.getElementById("receipt-store") as HTMLSelectElement | null;
   if (receiptStoreSel) {
     receiptStoreSel.onchange = () => {
@@ -2628,6 +2735,17 @@ function bindEvents(): void {
     };
   }
 }
+
+/**
+ * A link to another website opens in the system browser; the app window has no
+ * browser of its own, so such a link would otherwise do nothing.
+ */
+document.addEventListener("click", event => {
+  const link = (event.target as Element | null)?.closest?.('a[href^="https://"]') as HTMLAnchorElement | null;
+  if (!link || !("__TAURI_INTERNALS__" in window)) return;
+  event.preventDefault();
+  void openUrl(link.href).catch(error => showToast(`Poveznica se nije otvorila: ${error}`));
+});
 
 async function init() {
   try {

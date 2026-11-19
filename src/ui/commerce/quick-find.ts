@@ -46,6 +46,8 @@ const ARCHIVE_CHAINS: Record<string, ChainName> = {
   stridon: { name: "Stridon", locative: "Stridonu" },
 };
 export const CHAINS = Object.keys(DIRECT_CHAINS);
+/** Label of the one entry of a chain whose prices are the same in every shop (`retail_archive.rs`). */
+const ALL_SHOPS = "Sve poslovnice (iste cijene)";
 export const isArchiveChain = (chain: string) => !(chain in DIRECT_CHAINS);
 const named = (chain: string): ChainName | undefined => DIRECT_CHAINS[chain] ?? ARCHIVE_CHAINS[chain];
 export const chainName = (chain: string) => named(chain)?.name ?? chain.replace(/[_-]+/g, " ");
@@ -171,6 +173,9 @@ export function branchesNear(all: readonly ChainSources[], place: string, limit 
         if (words.every(w => label.includes(w))) rank = 0;
       }
       // Konzum lists its online shop like a branch; it is no shop to walk into.
+      // A chain with the same prices in every shop (dm) has one entry and no town;
+      // it belongs to every place.
+      if (rank < 0 && source.label === ALL_SHOPS) rank = 0;
       if (rank >= 0 && /^internet\b/i.test(source.label.trim())) rank += 10;
       if (rank >= 0) ranked.push({ source, rank });
     }

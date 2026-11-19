@@ -179,6 +179,18 @@ export async function exportReceiptXlsx(receipt: ReceiptSummary): Promise<string
   return invoke<string>("export_receipt_xlsx", { receipt });
 }
 
+/** Saves the given receipts in one workbook (summary, receipts, items); returns its path. */
+export async function exportReceiptsXlsx(receiptIds: number[], selection: string): Promise<string> {
+  const exportedOn = new Intl.DateTimeFormat("hr-HR").format(new Date());
+  return invoke<string>("export_receipts_xlsx", { receiptIds, selection, exportedOn });
+}
+
+/** Saves a shopping list as an Excel table; returns where the file was saved. */
+export async function exportListXlsx(listId: number): Promise<string> {
+  const exportedOn = new Intl.DateTimeFormat("hr-HR").format(new Date());
+  return invoke<string>("export_list_xlsx", { listId, exportedOn });
+}
+
 export async function listShoppingLists(): Promise<ShoppingList[]> {
   if (!isTauri()) return [];
   return invoke<ShoppingList[]>("list_shopping_lists");
@@ -187,6 +199,16 @@ export async function listShoppingLists(): Promise<ShoppingList[]> {
 /** A shared list is seen and edited by every member of the network, family included. */
 export async function createShoppingList(name: string, storeId?: number | null, shared = false): Promise<ShoppingList> {
   return invoke<ShoppingList>("create_shopping_list", { name, storeId: storeId ?? null, shared });
+}
+
+/** Deletes a list on every device; a shared one only from the device that manages the network. */
+export async function deleteShoppingList(listId: number): Promise<void> {
+  return invoke<void>("delete_shopping_list", { listId });
+}
+
+/** Shares a private list (a shared copy, the original archived) or stops sharing it. */
+export async function setListShared(listId: number, shared: boolean): Promise<ShoppingList> {
+  return invoke<ShoppingList>("set_list_shared", { listId, shared });
 }
 
 export async function addPlannedItem(params: {

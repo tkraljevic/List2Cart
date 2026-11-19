@@ -20,6 +20,12 @@ export function listCreationError(error: unknown): string {
   if (message.includes("Zajednicki popis moze stvoriti samo")) {
     return "Zajednički popis može stvoriti samo uređaj koji upravlja mrežom. Stvorite ga ondje ili stvorite običan popis.";
   }
+  if (message.includes("Zajednicki popis moze obrisati samo")) {
+    return "Zajednički popis može obrisati samo uređaj koji upravlja mrežom, jer bi nestao svima.";
+  }
+  if (message.includes("Dijeliti popise moze samo")) {
+    return "Dijeliti popise može samo uređaj koji upravlja mrežom.";
+  }
   if (message.includes("Privatni kanal dopusten")) {
     return "Ovaj uređaj nema pravo pisati osobne popise ove osobe. Povežite ga ponovno s uređajem koji upravlja mrežom.";
   }

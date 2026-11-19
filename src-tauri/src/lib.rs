@@ -2,7 +2,7 @@ use list2cart_core::{
     calc::{calculate_line_total_cents, verify_receipt as core_verify_receipt},
     db::Database,
     db::UpsertProductInput,
-    excel::export_receipt_to_xlsx,
+    excel::{export_list_to_xlsx, export_receipt_to_xlsx, export_receipts_to_xlsx},
     ledger::{LedgerStats, NetworkMember, PeerRole, generate_sas_code},
     models::{
         CartItem, OnlineProductInfo, PlannedItem, PocketBaseConfig, Product, ReceiptSummary,
@@ -315,10 +315,110 @@ fn export_receipt_xlsx(
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Saves the receipts the Računi view shows in one workbook, oldest first; returns
+/// its path. The receipts are read from the database by their IDs.
+#[tauri::command]
+fn export_receipts_xlsx(
+    state: State<'_, AppState>,
+    receipt_ids: Vec<i64>,
+    selection: String,
+    exported_on: String,
+) -> Result<String, String> {
+    let mut receipts: Vec<ReceiptSummary> = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        db.list_receipts()?
+            .into_iter()
+            .filter(|r| receipt_ids.contains(&r.id))
+            .collect()
+    };
+    if receipts.is_empty() {
+        return Err("Nema racuna za izvoz".into());
+    }
+    receipts.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    std::fs::create_dir_all(&state.export_dir)
+        .map_err(|e| format!("Greska kreiranja mape za izvoz: {e}"))?;
+    let date: String = exported_on.chars().take(20).collect();
+    let safe_date: String = date
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.')
+        .collect::<String>()
+        .trim_matches('.')
+        .replace('.', "-");
+    let path = state
+        .export_dir
+        .join(format!("List2Cart_racuni_{safe_date}.xlsx"));
+    let selection: String = selection.chars().take(200).collect();
+    export_receipts_to_xlsx(&receipts, &selection, &date, &path)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Saves one shopping list as an Excel table in the export folder; returns its path.
+/// The list is read from the database, so the file shows what is stored.
+#[tauri::command]
+fn export_list_xlsx(
+    state: State<'_, AppState>,
+    list_id: i64,
+    exported_on: String,
+) -> Result<String, String> {
+    let list = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        db.list_shopping_lists()?
+            .into_iter()
+            .find(|l| l.id == list_id)
+            .ok_or("Popis nije pronadjen")?
+    };
+    std::fs::create_dir_all(&state.export_dir)
+        .map_err(|e| format!("Greska kreiranja mape za izvoz: {e}"))?;
+    let safe_name: String = list
+        .name
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    let path = state
+        .export_dir
+        .join(format!("List2Cart_popis_{safe_name}_{}.xlsx", list.id));
+    let date: String = exported_on.chars().take(20).collect();
+    export_list_to_xlsx(&list, &date, &path)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 #[tauri::command]
 fn list_shopping_lists(state: State<'_, AppState>) -> Result<Vec<ShoppingList>, String> {
     let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
     db.list_shopping_lists()
+}
+
+#[tauri::command]
+fn delete_shopping_list(state: State<'_, AppState>, list_id: i64) -> Result<(), String> {
+    let res = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        db.delete_shopping_list(list_id)
+    };
+    if res.is_ok() {
+        state.notify_lan_change();
+    }
+    res
+}
+
+/// Shares a private list with every member of the network, or stops sharing it.
+#[tauri::command]
+fn set_list_shared(
+    state: State<'_, AppState>,
+    list_id: i64,
+    shared: bool,
+) -> Result<ShoppingList, String> {
+    let res = {
+        let db = state.db.lock().map_err(|_| "Greska zakljucavanja baze")?;
+        if shared {
+            db.share_shopping_list(list_id)
+        } else {
+            db.unshare_shopping_list(list_id)
+        }
+    };
+    if res.is_ok() {
+        state.notify_lan_change();
+    }
+    res
 }
 
 #[tauri::command]
@@ -896,6 +996,8 @@ async fn sync_pocketbase(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Opens https links (a retailer's price list, Ko-fi) in the system browser.
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             #[cfg(mobile)]
             app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
@@ -984,8 +1086,12 @@ pub fn run() {
             list_receipts,
             incomplete_receipt_count,
             export_receipt_xlsx,
+            export_list_xlsx,
+            export_receipts_xlsx,
             list_shopping_lists,
             create_shopping_list,
+            set_list_shared,
+            delete_shopping_list,
             add_planned_item,
             toggle_planned_item,
             remove_planned_item,

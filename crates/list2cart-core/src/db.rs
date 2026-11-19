@@ -575,6 +575,23 @@ impl Database {
 
     /// A list every member of the network sees and edits, family members included.
     /// Only a device that can admit members can make one.
+    /// Deletes a list on every device; a shared one only from a device that manages
+    /// the network.
+    pub fn delete_shopping_list(&self, list_id: i64) -> Result<(), String> {
+        self.local_delete_list(list_id)
+    }
+
+    /// Shares a private list: a shared copy with its items, the original archived.
+    pub fn share_shopping_list(&self, list_id: i64) -> Result<ShoppingList, String> {
+        self.local_set_list_shared(list_id, true)
+    }
+
+    /// Stops sharing: the shared list is archived and its items go back to the
+    /// private list it came from (or to a new private list).
+    pub fn unshare_shopping_list(&self, list_id: i64) -> Result<ShoppingList, String> {
+        self.local_set_list_shared(list_id, false)
+    }
+
     pub fn create_shared_shopping_list(
         &self,
         name: &str,

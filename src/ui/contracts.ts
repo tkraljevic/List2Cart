@@ -49,6 +49,8 @@ export interface AboutViewState {
   license: string;
   /** Trusted local asset URL, supplied by the host, never from peer data. */
   iconUrl: string;
+  /** Where to support the app's development; null where a donation link is not shown. */
+  supportUrl?: string | null;
 }
 
 export interface ViewHelpers {

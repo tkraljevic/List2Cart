@@ -37,6 +37,12 @@ export function renderAbout(state: AboutViewState, helpers: ViewHelpers): string
       <p class="fs-card-sub">Licenca aplikacije: ${esc(licenseText)}. Komponente imaju vlastite licence.</p>
     </section>
 
+    ${state.supportUrl ? `<section class="fs-card">
+      <h2 class="fs-card-title">Podržite razvoj</h2>
+      <p class="fs-card-sub">List2Cart je besplatan i bez reklama. Ako vam pomaže, možete častiti kavom.</p>
+      <a class="btn btn-outline" href="${esc(state.supportUrl)}" target="_blank" rel="noreferrer">Častite kavom na Ko-fi</a>
+    </section>` : ""}
+
     <button class="btn btn-primary fs-btn-full" type="button" data-goto="sync">Natrag na obitelj</button>
   </section>`;
 }
