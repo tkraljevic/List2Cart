@@ -1,5 +1,8 @@
 use crate::{
-    acl_types::{ListGrant, MemberRole, MemberRoleRecord, issue_member_role},
+    acl_types::{
+        ListGrant, ListPermission, MemberRole, MemberRoleRecord, issue_list_grant,
+        issue_member_role,
+    },
     apply::{store_control_record, verify_domain_version_auth},
     ledger::{PeerRole, Version, record_signed_version},
     models::ControlPayload,
@@ -8,12 +11,18 @@ use chrono::Utc;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, net::SocketAddr, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 use syncnet::{
     identity::{parse_public_key, principal_id_from_key, public_key_to_base64},
     pairing::{PairHello, PairIdentity, PairingSessionSlot, reject_pending_in_background},
     trust::{Membership, NetworkKey, Ovlast, Validity},
 };
+
+use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_MEMBERSHIP_VALIDITY_SECS: i64 = 365 * 24 * 3600;
 
@@ -332,7 +341,7 @@ pub fn prepare_welcome_pack(
     ctx: &PairingContext<'_>,
     peer_key: &[u8; 32],
     role: PeerRole,
-    _shared_lists: &str,
+    shared_lists: &str,
     admit: bool,
 ) -> Result<WelcomePack, String> {
     let now = Utc::now().timestamp();
@@ -463,7 +472,7 @@ pub fn prepare_welcome_pack(
             public_key_to_base64(ctx.network_pub.as_bytes()),
             root_sk,
         )
-    } else if let Some(ovlast) = our_ovlast {
+    } else if let Some(ref ovlast) = our_ovlast {
         let m = Membership::admit_as(
             ctx.device_key,
             ovlast.clone(),
@@ -474,7 +483,7 @@ pub fn prepare_welcome_pack(
         .map_err(|e| e.to_string())?;
         let r = MemberRoleRecord::admit_as(
             ctx.device_key,
-            ovlast,
+            ovlast.clone(),
             &peer_b64,
             &peer_vk,
             member_role,
@@ -509,6 +518,60 @@ pub fn prepare_welcome_pack(
     pack.role_for_you = Some(for_you_role);
     pack.control_versions.push(ctrl_version);
     pack.control_versions.push(role_version);
+
+    if member_role == MemberRole::FamilyMember {
+        let list_ids: Vec<&str> = shared_lists
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "*")
+            .collect();
+        for list_id in list_ids {
+            let grant_id = format!("grant:{peer_b64}:{list_id}");
+            let g = if let Some(root_sk) = ctx.network_key {
+                let net = NetworkKey::from_signing_key(ctx.network_name, root_sk.clone());
+                issue_list_grant(
+                    &net,
+                    &grant_id,
+                    list_id,
+                    &peer_vk,
+                    ListPermission::Write,
+                    "root",
+                    validity,
+                )
+                .map_err(|e| e.to_string())?
+            } else if let Some(ref ovlast) = our_ovlast {
+                use base64::{Engine, engine::general_purpose::STANDARD};
+                use ed25519_dalek::Signer;
+                let mut g = ListGrant {
+                    network: public_key_to_base64(ctx.network_pub.as_bytes()),
+                    grant_id: grant_id.clone(),
+                    list_sync_id: list_id.to_owned(),
+                    recipient_pub_key: peer_b64.clone(),
+                    permission: ListPermission::Write,
+                    issued_by: our_b64.clone(),
+                    issued_at: validity.issued_at,
+                    expires_at: validity.expires_at().map_err(|e| e.to_string())?,
+                    signature: String::new(),
+                    admitter: Some(ovlast.clone()),
+                };
+                let sig = ctx.device_key.sign(&g.signed_bytes());
+                g.signature = STANDARD.encode(sig.to_bytes());
+                g
+            } else {
+                continue;
+            };
+            let gv = build_in_memory_control_version(
+                ctx.conn,
+                &signer_node,
+                signer_sk,
+                "list_grant",
+                &format!("list_grant:{}", g.grant_id),
+                &ControlPayload::ListGrant(g.clone()),
+            )?;
+            pack.grants.push(g);
+            pack.control_versions.push(gv);
+        }
+    }
 
     Ok(pack)
 }
@@ -643,8 +706,21 @@ pub fn finalize_pairing_in_db(
     let mut joined_update: Option<JoinedNetworkUpdate> = None;
     let mut peer_is_member = false;
     let mut peer_admitted_by_us = false;
+    let mut joined_peer_role: Option<PeerRole> = None;
 
     let we_are_admitting_peer = given.and_then(|g| g.for_you.as_ref()).is_some();
+
+    if we_are_admitting_peer
+        && let Some(theirs) = received
+        && !theirs.network_key.is_empty()
+        && theirs.network_key != our_net_b64
+        && theirs.for_you.is_some()
+    {
+        return Err(
+            "Obje strane su pokusale primiti jedna drugu u razlicite mreze; na uredjaju koji se pridruzuje odaberite 'Pridruzi se mrezi partnera'."
+                .into(),
+        );
+    }
 
     if !we_are_admitting_peer
         && let Some(theirs) = received
@@ -779,6 +855,14 @@ pub fn finalize_pairing_in_db(
             resign_local_domain_records(&tx, ctx.device_key, &new_net_vk, &new_principal, now)?;
         }
 
+        joined_peer_role = Some(theirs.my_role.as_ref().map_or(
+            PeerRole::OwnDevice,
+            |r| match r.role {
+                MemberRole::OwnDevice => PeerRole::OwnDevice,
+                MemberRole::FamilyMember => PeerRole::FamilyMember,
+            },
+        ));
+
         joined_update = Some(JoinedNetworkUpdate {
             network_public: new_net_vk,
             principal: new_principal,
@@ -835,6 +919,14 @@ pub fn finalize_pairing_in_db(
                 let role_ctrl = ControlPayload::MemberRole(role_for_peer.clone());
                 store_control_record(&tx, ctx.network_pub, &role_ctrl, now)?;
             }
+            for g in &our_pack.grants {
+                store_control_record(
+                    &tx,
+                    ctx.network_pub,
+                    &ControlPayload::ListGrant(g.clone()),
+                    now,
+                )?;
+            }
             for cv in &our_pack.control_versions {
                 insert_control_version_if_missing(&tx, cv)?;
             }
@@ -878,6 +970,12 @@ pub fn finalize_pairing_in_db(
     } else {
         shared_lists.trim()
     };
+    let stored_role = joined_peer_role.unwrap_or(role);
+    let stored_lists = if stored_role == PeerRole::OwnDevice {
+        "*"
+    } else {
+        clean_lists
+    };
     tx.execute(
         "INSERT INTO network_members (peer_id, name, role, sas_code, channels, shared_lists, added_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -890,10 +988,10 @@ pub fn finalize_pairing_in_db(
         params![
             peer_b64,
             clean_name,
-            role.as_str(),
+            stored_role.as_str(),
             sas_code,
-            role.channels(),
-            clean_lists,
+            stored_role.channels(),
+            stored_lists,
             Utc::now().to_rfc3339(),
         ],
     )
@@ -1099,12 +1197,26 @@ pub fn verify_or_recover_peer_access(
 #[derive(Clone, Default)]
 pub struct PairingController {
     slot: PairingSessionSlot,
+    confirmation: Arc<Mutex<Option<CancellationToken>>>,
+}
+
+// The active token is retained through finalization, so stop_listening and the
+// final database commit have a single ordering even when IPC calls race.
+struct ConfirmationGuard(Arc<Mutex<Option<CancellationToken>>>);
+
+impl Drop for ConfirmationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.0.lock() {
+            active.take();
+        }
+    }
 }
 
 impl PairingController {
     pub fn new() -> Self {
         Self {
             slot: PairingSessionSlot::new(),
+            confirmation: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1136,6 +1248,10 @@ impl PairingController {
     }
 
     pub fn stop_listening(&self, can_admit: bool) -> PairStatusView {
+        let active = self.confirmation.lock().expect("pairing confirmation lock");
+        if let Some(cancel) = active.as_ref() {
+            cancel.cancel();
+        }
         let _ = self.slot.stop_listening();
         self.status(can_admit)
     }
@@ -1159,10 +1275,23 @@ impl PairingController {
         shared_lists: &str,
         admit: bool,
     ) -> Result<PairOutcomeView, String> {
-        let pending = self
-            .slot
-            .take_pending()
-            .ok_or_else(|| "Nema uparivanja koje ceka odluku".to_owned())?;
+        let (pending, cancel) = {
+            let mut active = self
+                .confirmation
+                .lock()
+                .map_err(|_| "Greska zakljucavanja potvrde uparivanja".to_owned())?;
+            if active.is_some() {
+                return Err("Potvrda uparivanja je vec u tijeku".to_owned());
+            }
+            let pending = self
+                .slot
+                .take_pending()
+                .ok_or_else(|| "Nema uparivanja koje ceka odluku".to_owned())?;
+            let cancel = CancellationToken::new();
+            *active = Some(cancel.clone());
+            (pending, cancel)
+        };
+        let _confirmation = ConfirmationGuard(Arc::clone(&self.confirmation));
         let peer_hello = pending.peer_hello().clone();
         let peer_key = *pending.peer_key();
         let peer_b64 = pending.peer_key_base64();
@@ -1184,10 +1313,11 @@ impl PairingController {
             None
         };
 
-        let finish_res = pending
-            .finish(approved, given.as_ref())
-            .await
-            .map_err(|e| e.to_string())?;
+        let finish_res = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err("Uparivanje je otkazano".to_owned()),
+            result = pending.finish(approved, given.as_ref()) => result.map_err(|e| e.to_string())?,
+        };
 
         if !finish_res.approved {
             return Ok(PairOutcomeView {
@@ -1210,6 +1340,13 @@ impl PairingController {
         let mut db = db_mutex
             .lock()
             .map_err(|_| "Greska zakljucavanja baze".to_owned())?;
+        let _active = self
+            .confirmation
+            .lock()
+            .map_err(|_| "Greska zakljucavanja potvrde uparivanja".to_owned())?;
+        if cancel.is_cancelled() {
+            return Err("Uparivanje je otkazano".to_owned());
+        }
         db.finalize_pairing(
             &peer_hello,
             &peer_key,
@@ -1237,5 +1374,185 @@ impl PairingController {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             meta: BTreeMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use crate::db::Database;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    struct Peers {
+        left: PairingController,
+        right: PairingController,
+        left_db: Arc<Mutex<Database>>,
+        right_db: Arc<Mutex<Database>>,
+    }
+
+    fn identity(db: &Mutex<Database>, name: &str) -> (SigningKey, PairIdentity) {
+        let db = db.lock().unwrap();
+        let key = db.clone_device_signing_key();
+        let public = public_key_to_base64(key.verifying_key().as_bytes());
+        let identity =
+            PairingController::build_pair_identity(&public, name, crate::apply::PROTOCOL_NAME);
+        (key, identity)
+    }
+
+    async fn connected_peers() -> Peers {
+        let peers = Peers {
+            left: PairingController::new(),
+            right: PairingController::new(),
+            left_db: Arc::new(Mutex::new(Database::open_in_memory().unwrap())),
+            right_db: Arc::new(Mutex::new(Database::open_in_memory().unwrap())),
+        };
+        let (key, hello) = identity(&peers.left_db, "left");
+        let status = peers
+            .left
+            .start_listening("127.0.0.1:0".parse().unwrap(), key, hello, true)
+            .await
+            .unwrap();
+        let addr = format!("127.0.0.1:{}", status.listen_port.unwrap())
+            .parse()
+            .unwrap();
+        let (key, hello) = identity(&peers.right_db, "right");
+        peers.right.dial(addr, key, hello, true).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !peers.left.status(true).pending {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(peers.left.status(true).sas, peers.right.status(true).sas);
+        peers
+    }
+
+    #[tokio::test]
+    async fn stop_closes_waiting_listener() {
+        let controller = PairingController::new();
+        let db = Mutex::new(Database::open_in_memory().unwrap());
+        let (key, hello) = identity(&db, "waiting");
+        let status = controller
+            .start_listening("127.0.0.1:0".parse().unwrap(), key, hello, true)
+            .await
+            .unwrap();
+        let addr = format!("127.0.0.1:{}", status.listen_port.unwrap());
+        let stopped = controller.stop_listening(true);
+        assert!(!stopped.waiting && !stopped.pending);
+        timeout(Duration::from_secs(2), async {
+            while tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener must close after cancellation");
+    }
+
+    #[tokio::test]
+    async fn stop_rejects_pending_partner_without_adding_members() {
+        let peers = connected_peers().await;
+        let stopped = peers.left.stop_listening(true);
+        assert!(!stopped.waiting && !stopped.pending);
+        let result = timeout(
+            Duration::from_secs(2),
+            peers
+                .right
+                .confirm(&peers.right_db, true, PeerRole::OwnDevice, "*", false),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err() || !result.unwrap().paired);
+        assert!(
+            peers
+                .left_db
+                .lock()
+                .unwrap()
+                .list_members()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            peers
+                .right_db
+                .lock()
+                .unwrap()
+                .list_members()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_interrupts_confirmation_already_waiting_for_partner() {
+        let peers = connected_peers().await;
+        let controller = peers.left.clone();
+        let db = Arc::clone(&peers.left_db);
+        let task = tokio::spawn(async move {
+            controller
+                .confirm(&db, true, PeerRole::OwnDevice, "*", true)
+                .await
+        });
+        timeout(Duration::from_secs(2), async {
+            while peers.left.confirmation.lock().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        peers.left.stop_listening(true);
+        let result = timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err(), "Uparivanje je otkazano");
+        assert!(peers.left.confirmation.lock().unwrap().is_none());
+        peers.right.stop_listening(true);
+        assert!(
+            peers
+                .left_db
+                .lock()
+                .unwrap()
+                .list_members()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            peers
+                .right_db
+                .lock()
+                .unwrap()
+                .list_members()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_confirmation_still_completes_for_both_partners() {
+        let peers = connected_peers().await;
+        let (left, right) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                peers
+                    .left
+                    .confirm(&peers.left_db, true, PeerRole::OwnDevice, "*", true),
+                peers
+                    .right
+                    .confirm(&peers.right_db, true, PeerRole::OwnDevice, "*", false),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(left.unwrap().paired);
+        assert!(right.unwrap().paired);
+        assert_eq!(
+            peers.left_db.lock().unwrap().list_members().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            peers.right_db.lock().unwrap().list_members().unwrap().len(),
+            1
+        );
     }
 }

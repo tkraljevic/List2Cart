@@ -596,6 +596,14 @@ impl Database {
         self.local_toggle_item(item_id, checked)
     }
 
+    pub fn remove_planned_item(&self, item_sync_id: &str) -> Result<(), String> {
+        self.set_record_archived(
+            crate::db::local::LocalEntity::PlannedItem,
+            item_sync_id,
+            true,
+        )
+    }
+
     pub fn list_shopping_lists(&self) -> Result<Vec<ShoppingList>, String> {
         let mut stmt = self
             .conn

@@ -41,3 +41,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.log
+
+# Lokalni instalacijski paketi i build izvještaji
+/builds/

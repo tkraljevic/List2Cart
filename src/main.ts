@@ -41,6 +41,7 @@ import {
   lookupBarcodeOnline,
   newSasCode,
   removeNetworkMember,
+  removePlannedItem,
   runLedgerCompact,
   savePocketbaseUrl,
   saveReceipt,
@@ -70,6 +71,16 @@ import { SyncTracker } from "./sync-progress";
 import { compareBasket, formatDate, formatQuantity, resolveBasketProduct, sharedListNames } from "./shopping";
 import type { BasketComparison } from "./shopping";
 import { icon } from "./icons";
+import { renderNavigation, renderProductTabs } from "./ui/shell";
+import { editCartItem, renderCartEditor } from "./ui/commerce/cart-editor";
+import { renderListCards } from "./ui/commerce/lists";
+import { renderFamily, renderMemberDialog as renderMemberView } from "./ui/family";
+import { renderAbout } from "./ui/about";
+import { renderPairingDialog as renderPairingView } from "./ui/pairing";
+import { renderSyncProgress as renderProgressView, renderSyncOverview, renderIdentityConflicts as renderConflictView } from "./ui/sync";
+import { appMetadata } from "./ui/app-metadata";
+import type { FamilyViewState, ViewHelpers } from "./ui/contracts";
+import "./ui/family-sync.css";
 
 const syncTracker = new SyncTracker(() => render());
 const retail = {sources:[] as PriceSource[],results:null as RetailResults|null,query:"",branch:"",busy:false,error:"",storeId:0};
@@ -87,7 +98,7 @@ import type {
   Unit,
 } from "./types";
 
-type Tab = "pregled" | "kosarica" | "planer" | "racuni" | "katalog" | "cijene" | "trgovine" | "sync" | "napredno";
+type Tab = "pregled" | "kosarica" | "planer" | "racuni" | "katalog" | "cijene" | "trgovine" | "sync" | "napredno" | "about";
 
 interface BarcodeDetectorLike {
   detect(source: ImageBitmapSource): Promise<Array<{ rawValue?: string }>>;
@@ -149,6 +160,7 @@ interface AppModel {
   members: NetworkMember[];
   pendingSasCode: string;
   pairingRole: PeerRole;
+  pairingAdmit: boolean;
   scannerOpen: boolean;
   selectedProduct: Product | null;
   selectedProductPrices: StorePrice[];
@@ -179,6 +191,7 @@ interface AppModel {
   pairingOpen: boolean;
   pairingConfirmed: boolean;
   pairingBusy: boolean;
+  pairingAction: "confirming" | "cancelling" | null;
   pairMode: "lan" | "offline";
   pairStatus: PairStatusView | null;
   draftPairAddr: string;
@@ -203,7 +216,7 @@ const model: AppModel = {
   conflicts: [],
   conflictReview: null,
   resolvingConflict: false,
-  tab: window.matchMedia("(max-width: 768px)").matches ? "planer" : "pregled",
+  tab: "planer",
   stores: [],
   selectedStoreId: 1,
   cart: [],
@@ -219,6 +232,7 @@ const model: AppModel = {
   members: [],
   pendingSasCode: "482-915",
   pairingRole: "family_member",
+  pairingAdmit: true,
   scannerOpen: false,
   selectedProduct: null,
   selectedProductPrices: [],
@@ -249,6 +263,7 @@ const model: AppModel = {
   pairingOpen: false,
   pairingConfirmed: false,
   pairingBusy: false,
+  pairingAction: null,
   pairMode: "lan",
   pairStatus: null,
   draftPairAddr: "",
@@ -268,9 +283,50 @@ const model: AppModel = {
   exportListIds: [],
 };
 
+let pairingOperation = 0;
+let syncDetailsOpen = false;
+let editingCartItemId: string | null = null;
+
 let scannerDecodeTimer: number | null = null;
 let pairPollTimer: number | null = null;
 let nativeScannerActive = false;
+
+/** Cancel native work before dismissing the dialog; ignore stale IPC completions. */
+async function cancelPairing(): Promise<void> {
+  if (model.pairingAction === "cancelling") return;
+  if (model.pairingBusy && model.pairingAction !== "confirming") return;
+  const wasConfirming = model.pairingAction === "confirming";
+  ++pairingOperation;
+  if (pairPollTimer !== null) {
+    window.clearInterval(pairPollTimer);
+    pairPollTimer = null;
+  }
+  model.pairingBusy = true;
+  model.pairingAction = "cancelling";
+  render();
+  try {
+    if (model.pairMode === "lan" && (wasConfirming || model.pairStatus?.waiting || model.pairStatus?.pending)) {
+      model.pairStatus = await stopPairListening();
+    }
+    model.pairingConfirmed = false;
+    model.pairingOpen = false;
+    // Cancellation cannot retract a confirmation already sent to the peer.
+    // Refresh actual membership instead of assuming that no pairing took place.
+    try {
+      model.members = await listNetworkMembers();
+      model.ledgerStats = await getLedgerStats();
+    } catch (error) {
+      model.toast = `Čekanje je prekinuto, ali pregled uređaja nije osvježen: ${error}`;
+    }
+    model.pairingAction = null;
+    model.pairingBusy = false;
+  } catch (error) {
+    model.pairingAction = wasConfirming ? "confirming" : null;
+    model.pairingBusy = wasConfirming;
+    model.toast = `Prekid povezivanja nije potvrđen. Pokušajte ponovno: ${error}`;
+  }
+  render();
+}
 
 function renderToastOnly(): void {
   const container = document.getElementById("toast-container");
@@ -307,52 +363,12 @@ function parseEuroToCents(raw: string): number {
   return Number.isFinite(val) && val > 0 ? Math.round(val * 100) : 0;
 }
 
-const APP_ICON_SVG = `
-<svg class="brand-logo" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <linearGradient id="bgGrad" x1="16" y1="8" x2="112" y2="120" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#2D8CFF"/>
-      <stop offset="55%" stop-color="#1768D1"/>
-      <stop offset="100%" stop-color="#0E4999"/>
-    </linearGradient>
-  </defs>
-  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#bgGrad)"/>
-  <path d="M24 34H34.5C36.6 34 38.4 35.4 38.9 37.5L47.2 74.5C47.7 76.6 49.5 78 51.6 78H89.5C91.6 78 93.4 76.6 93.9 74.6L100.8 46.8C101.4 44.3 99.5 42 97 42H41" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="54" cy="95" r="6.5" fill="#FFFFFF"/>
-  <circle cx="88" cy="95" r="6.5" fill="#FFFFFF"/>
-  <path d="M56 58L65 67L84 48" stroke="#60BD68" stroke-width="7.5" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M56 58L65 67L84 48" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>`;
-
-const NAV_ITEMS: { id: Exclude<Tab, "napredno">; label: string }[] = [
-  { id: "pregled", label: "Pregled" },
-  { id: "planer", label: "Popisi" },
-  { id: "kosarica", label: "Kupnja" },
-  { id: "racuni", label: "Računi" },
-  { id: "katalog", label: "Katalog" },
-  { id: "cijene", label: "Cijene" },
-  { id: "trgovine", label: "Trgovine" },
-  { id: "sync", label: "Obitelj i uređaji" },
-];
-
 function renderSidebar(): string {
-  const navButton = (id: Exclude<Tab, "napredno">, label: string, mobile = false) => {
-    const active = model.tab === id || (id === "sync" && model.tab === "napredno");
-    return `<button class="nav-btn ${active ? "active" : ""}" data-tab="${id}" ${active ? 'aria-current="page"' : ""}>
-      ${icon(id)}<span>${escapeHtml(mobile && id === "sync" ? "Obitelj" : label)}</span></button>`;
-  };
-  return `<aside class="sidebar no-print">
-    <div class="brand-box">${APP_ICON_SVG}<div><div class="brand-title">List2Cart</div><div class="brand-tag">Privatna kupnja</div></div></div>
-    <nav class="nav-list" aria-label="Glavna navigacija">${NAV_ITEMS.map(n => navButton(n.id, n.label)).join("")}</nav>
-    <div class="sidebar-footer"><strong>Lokalno spremljeno</strong><p>Razmjena samo s odabranim uređajima.</p></div>
-  </aside>
-  <nav class="mobile-nav no-print" aria-label="Mobilna navigacija">
-    ${NAV_ITEMS.filter(n => ["planer", "kosarica", "racuni", "sync"].includes(n.id)).map(n => navButton(n.id, n.label, true)).join("")}
-  </nav>`;
+  return renderNavigation(model.tab);
 }
 
 function pageHeader(title: string, description: string, action = ""): string {
-  const secondary = ["pregled", "katalog", "cijene", "trgovine", "napredno"].includes(model.tab);
+  const secondary = ["pregled", "napredno"].includes(model.tab);
   return `<header class="page-header">
     <div>${secondary ? `<button class="back-link mobile-only no-print" data-goto="sync">${icon("back")} Obitelj i više</button>` : ""}
       <h1>${title}</h1>${description ? `<p>${description}</p>` : ""}</div>${action}</header>`;
@@ -397,7 +413,7 @@ function renderKosarica(): string {
   const diff = total - parseEuroToCents(model.receiptTotalInput);
   const hasReceipt = model.receiptTotalInput.trim().length > 0;
   const storeSelect = `<select id="cart-store-select" aria-label="Trgovina za kupnju">${model.stores.length ? model.stores.map(s => `<option value="${s.id}" ${s.id === model.selectedStoreId ? "selected" : ""}>${escapeHtml(s.name)}</option>`).join("") : '<option value="">Dodajte trgovinu</option>'}</select>`;
-  return `${pageHeader("Košarica", "Dodajte artikle i na blagajni usporedite unesene iznose.", storeSelect)}
+  return `${pageHeader("Kupnja", "Dodajte artikle i na blagajni usporedite unesene iznose.", storeSelect)}
     <section class="card cart-entry no-print" aria-label="Dodaj artikl u košaricu">
       <button class="btn btn-primary scan-button" id="btn-camera-scan">${icon("scan")} Skeniraj barkod</button>
       <div class="cart-inputs">
@@ -417,7 +433,7 @@ function renderKosarica(): string {
           return `<div class="basket-row">
             ${img ? `<div class="item-thumb"><img src="${escapeHtml(img)}" alt="" /></div>` : ""}
             <div class="item-copy"><div class="item-title">${escapeHtml(item.name)}</div><div class="item-sub">${formatQuantity(item.quantity)} ${item.unit === "l" ? "L" : item.unit} × ${escapeHtml(formatCents(item.unit_price_cents))}${item.unit === "g" || item.unit === "kg" ? "/kg" : item.unit === "ml" || item.unit === "l" ? "/L" : ""}</div></div>
-            <div class="item-price">${escapeHtml(formatCents(item.total_cents))}</div>
+            <button class="text-button cart-edit-trigger" data-edit-cart="${escapeHtml(item.id)}" aria-label="Uredi količinu i cijenu za ${escapeHtml(item.name)}">${escapeHtml(formatCents(item.total_cents))}<span>Uredi</span></button>
             <button class="icon-button btn-danger-ghost no-print" data-remove-cart="${escapeHtml(item.id)}" aria-label="Ukloni ${escapeHtml(item.name)}">${icon("close")}</button>
           </div>`;
         }).join("")}
@@ -442,6 +458,7 @@ function renderPlaner(): string {
   const total = items.reduce((sum, i) => sum + lineTotal(i), 0);
   const remainingTotal = remaining.reduce((sum, i) => sum + lineTotal(i), 0);
   return `${pageHeader("Popisi", "Pripremite kupnju i označite kupljene artikle.", `<div class="header-actions">${model.lists.length ? `<select id="active-list-select" aria-label="Aktivni popis">${model.lists.map(l => `<option value="${l.id}" ${l.id === list?.id ? "selected" : ""}>${escapeHtml(l.name)}</option>`).join("")}</select>` : ""}<button class="btn btn-outline" id="btn-new-list" aria-expanded="${model.newListOpen}">${icon("plus")} Novi popis</button></div>`)}
+    ${renderListCards(model.lists, list?.id, escapeHtml)}
     ${model.newListOpen ? `<section class="card no-print" aria-label="Novi popis"><h2>Novi popis za kupnju</h2><div class="row-wrap">
       <label class="field grow">Naziv popisa<input id="inp-new-list" value="${escapeHtml(model.draftNewList)}" placeholder="Npr. Tjedna nabavka" /></label>
       <label class="field">Trgovina<select id="sel-list-store"><option value="">Sve trgovine</option>${model.stores.map(s => `<option value="${s.id}" ${s.id === model.selectedStoreId ? "selected" : ""}>${escapeHtml(s.name)}</option>`).join("")}</select></label>
@@ -454,7 +471,7 @@ function renderPlaner(): string {
       </div></details></section>
       <section class="card plan-progress"><div class="row space-between"><span class="item-sub">${checked} od ${items.length} kupljeno</span><strong class="item-price">${escapeHtml(formatCents(total))}</strong></div><div class="progress-track" role="progressbar" aria-label="Kupljeni artikli" aria-valuemin="0" aria-valuemax="${Math.max(items.length, 1)}" aria-valuenow="${checked}"><div class="progress-fill" style="width:${items.length ? checked / items.length * 100 : 0}%"></div></div></section>
       <div class="plan-layout"><section class="card plan-items" aria-label="Stavke popisa ${escapeHtml(list.name)}">
-        ${items.length ? items.map(item => `<label class="plan-row ${item.checked ? "is-checked" : ""}"><input type="checkbox" data-toggle-plan="${item.id}" ${item.checked ? "checked" : ""} /><span class="item-copy"><span class="item-title">${escapeHtml(item.name)}</span><span class="item-sub">${formatQuantity(item.quantity)} ${item.unit === "l" ? "L" : item.unit}</span></span><span class="item-price">${escapeHtml(formatCents(lineTotal(item)))}</span></label>`).join("") : '<div class="empty-state"><h2>Što trebate kupiti?</h2><p>Dodajte prvi artikl na ovaj popis.</p></div>'}
+        ${items.length ? items.map(item => `<div class="plan-row ${item.checked ? "is-checked" : ""}"><label class="row grow"><input type="checkbox" data-toggle-plan="${item.id}" ${item.checked ? "checked" : ""} /><span class="item-copy"><span class="item-title">${escapeHtml(item.name)}</span><span class="item-sub">${formatQuantity(item.quantity)} ${item.unit === "l" ? "L" : item.unit}</span></span></label><span class="item-price">${escapeHtml(formatCents(lineTotal(item)))}</span><button class="icon-button btn-danger-ghost no-print" type="button" data-remove-plan="${escapeHtml(item.sync_id)}" aria-label="Ukloni ${escapeHtml(item.name)}">${icon("close")}</button></div>`).join("") : '<div class="empty-state"><h2>Što trebate kupiti?</h2><p>Dodajte prvi artikl na ovaj popis.</p></div>'}
       </section><section class="card plan-summary"><div class="row space-between"><span class="item-sub">Preostalo · ${remaining.length} artikala</span><strong class="checkout-total">${escapeHtml(formatCents(remainingTotal))}</strong></div>
         <button class="btn btn-primary" id="btn-transfer-cart" ${remaining.length ? "" : "disabled"}>Kreni u kupnju</button><p class="item-sub">Preostali artikli dodaju se u košaricu s unesenim procjenama cijena.</p><button class="text-button" data-goto="cijene">Usporedi cijene popisa →</button><button class="text-button no-print" data-toggle-retail>Pronađi artikl u cjeniku</button>
       </section></div>` : `<section class="card empty-state">${icon("planer")}<h2>Vaš prvi popis za kupnju</h2><p>Odaberite Novi popis i zapišite što trebate.</p></section>`}`;
@@ -610,126 +627,27 @@ function renderTrgovine(): string {
 }
 
 function peerSyncRecord(peerId: string): PeerSyncRecord | undefined {
-  return model.lanStatus?.peers.find((p) => p.peer_public_key === peerId);
+  return model.lanStatus?.peers.find(peer => peer.peer_public_key === peerId);
 }
 
-function renderPeerSyncDetails(m: NetworkMember): string {
-  const rec = peerSyncRecord(m.peer_id);
-  const manualVal = model.draftManualAddrs[m.peer_id] ?? rec?.manual_addr ?? rec?.last_addr ?? "";
-  const pathLabel = rec?.last_path === "lan" ? "LAN" : rec?.last_path === "manual" ? "Ručna adresa" : "—";
-  const lastSync = rec?.last_sync_at ? formatDate(rec.last_sync_at) : "Još nije razmijenjeno";
-  const summaryStats = rec ? `${pathLabel} · ${lastSync} · primljeno ${rec.last_applied}, poslano ${rec.last_sent}` : "Čeka prvu razmjenu";
-  return `<details class="peer-sync-details">
-    <summary class="item-sub">${escapeHtml(summaryStats)}${rec?.last_error ? ` · <span class="error-inline">Greška: ${escapeHtml(rec.last_error)}</span>` : ""}</summary>
-    <div class="peer-sync-controls">
-      <div class="item-sub">Zadnja adresa: ${escapeHtml(rec?.last_addr ?? "—")}</div>
-      <div class="row-wrap">
-        <input class="inp-manual-addr" data-manual-addr-input="${escapeHtml(m.peer_id)}" value="${escapeHtml(manualVal)}" placeholder="IP:port (npr. 192.168.1.25:4411)" />
-        <button class="btn btn-outline" data-save-manual-addr="${escapeHtml(m.peer_id)}" ${model.lanBusy ? "disabled" : ""}>Spremi adresu</button>
-        <button class="btn btn-primary" data-sync-peer-at="${escapeHtml(m.peer_id)}" ${model.lanBusy ? "disabled" : ""}>Razmijeni sada</button>
-      </div>
-    </div>
-  </details>`;
+const viewHelpers: ViewHelpers = { escapeHtml, formatDate, sharedListNames };
+
+function familyState(): FamilyViewState {
+  return { ...model, progress: syncTracker.progress };
 }
 
 function renderSync(): string {
-  const ownDevices = model.members.filter(m => m.role === "own_device");
-  const family = model.members.filter(m => m.role === "family_member");
-  const progress = syncTracker.progress;
-  const lan = model.lanStatus;
-  const lanStateLabel = !lan
-    ? "LAN servis nije dostupan"
-    : !lan.running
-      ? "LAN razmjena zaustavljena"
-      : lan.paused
-        ? "LAN razmjena pauzirana"
-        : "LAN razmjena aktivna";
-  const status = progress?.state === "running"
-    ? "Razmjena je u tijeku"
-    : progress?.state === "error"
-      ? "Razmjena nije dovršena"
-      : lan?.last_error && !lan.running
-        ? lanStateLabel
-        : lan?.running && !lan.paused
-          ? "Automatska LAN razmjena je uključena"
-          : "Podaci su spremljeni na uređaju";
-  return `${pageHeader("Obitelj i uređaji", "Birajte što dijelite. Osobni računi ostaju na vašim uređajima.")}
-    <section class="family-status ${progress?.state === "error" || lan?.last_error ? "has-error" : ""}">
-      <div>
-        <h2>${escapeHtml(status)}</h2>
-        <p>${progress ? `Zadnja radnja: ${escapeHtml(progress.title)} · ${escapeHtml(new Date(progress.updatedAt).toLocaleString("hr-HR"))}` : lan?.running ? `${escapeHtml(lanStateLabel)} · sluša na ${escapeHtml(lan.exchange_addr || "—")}${lan.last_round_at ? ` · zadnji krug ${escapeHtml(formatDate(lan.last_round_at))}` : ""}` : "Za razmjenu s drugim uređajem pokrenite LAN servis ili izvezite/uvezite paket."}</p>
-        ${lan?.last_error ? `<p class="item-sub error-inline">Zadnja greška: ${escapeHtml(lan.last_error)}</p>` : ""}
-      </div>
-      <div class="row-wrap">
-        <button class="btn btn-primary" id="btn-open-pairing">Dodaj uređaj ili člana</button>
-        ${lan?.running
-          ? `<button class="btn btn-outline" id="btn-lan-sync-now" ${model.lanBusy || lan.paused ? "disabled" : ""}>${model.lanBusy ? "Razmjena…" : "Sinkroniziraj sada"}</button>
-             <button class="btn btn-outline" id="btn-lan-pause" ${model.lanBusy ? "disabled" : ""}>${lan.paused ? "Nastavi" : "Pauziraj"}</button>
-             <button class="btn btn-subtle" id="btn-lan-stop" ${model.lanBusy ? "disabled" : ""}>Zaustavi</button>`
-          : `<button class="btn btn-outline" id="btn-lan-start" ${model.lanBusy ? "disabled" : ""}>Pokreni LAN</button>`}
-      </div>
-    </section>
-    <section class="card"><h2>Moji uređaji</h2><p class="item-sub">Pristup mojim računima, popisima i katalogu.</p><div class="device-row"><strong>Ovaj uređaj</strong><span class="item-sub">Lokalno spremljeno${lan?.exchange_addr ? ` · ${escapeHtml(lan.exchange_addr)}` : ""}</span></div>${ownDevices.map(m => `<div class="member-block"><div class="device-row"><div class="item-copy"><strong>${escapeHtml(m.name)}</strong><span class="item-sub">Dodan ${escapeHtml(formatDate(m.added_at))} · svi osobni podaci</span></div><button class="btn btn-outline" data-member-access="${escapeHtml(m.peer_id)}">Pregled pristupa</button></div>${renderPeerSyncDetails(m)}</div>`).join("")}</section>
-    <section class="card"><h2>Podijeljeno s obitelji</h2><p class="item-sub">Odabrani popisi i podaci o njihovim artiklima.</p>${family.length ? family.map(m => `<div class="member-block"><div class="member-row"><div class="item-copy"><strong>${escapeHtml(m.name)}</strong><span class="item-sub">${escapeHtml(sharedListNames(m.shared_lists, model.lists).join(" · ") || "Popisi nisu navedeni")}</span></div><button class="btn btn-outline" data-member-access="${escapeHtml(m.peer_id)}">Pregled pristupa</button></div>${renderPeerSyncDetails(m)}</div>`).join("") : '<div class="empty-state compact"><p>Još nema dodanih članova obitelji.</p></div>'}</section>
-    <section class="card package-card"><h2>Ručna razmjena paketima</h2><p class="item-sub">Izvezite paket i otvorite ga na drugom uređaju kad nisu na istoj mreži. Izvoz ne potvrđuje primitak.</p><div class="row-wrap"><button class="btn btn-outline" id="btn-export-bundle">Izvezi za moj uređaj</button><label class="btn btn-primary file-button">Uvezi paket<input id="inp-import-bundle" type="file" accept=".json,.list2cart" /></label></div>
-      <details><summary>Pošalji odabrane popise obitelji</summary><div class="list-choices">${model.lists.length ? model.lists.map(l => `<label class="check-option"><input type="checkbox" data-export-list="${escapeHtml(l.sync_id)}" ${model.exportListIds.includes(l.sync_id) ? "checked" : ""} /><span>${escapeHtml(l.name)}</span></label>`).join("") : '<p class="item-sub">Najprije kreirajte popis za kupnju.</p>'}</div><button class="btn btn-outline" id="btn-export-family-bundle" ${model.exportListIds.length ? "" : "disabled"}>Izvezi odabrane popise</button></details>
-    </section>
-    <div class="family-footer"><button class="btn btn-outline" data-goto="napredno">Napredne postavke</button><span class="item-sub">Vlastiti server je opcionalan.</span></div>
-    <section class="mobile-only mobile-more no-print" aria-label="Više mogućnosti"><h2>Više mogućnosti</h2><div class="grid-2">${NAV_ITEMS.filter(n => ["pregled", "katalog", "cijene", "trgovine"].includes(n.id)).map(n => `<button class="card action-card" data-goto="${n.id}">${icon(n.id)}<strong>${n.label} →</strong></button>`).join("")}</div></section>`;
+  if (syncDetailsOpen) return renderSyncOverview(familyState(), viewHelpers);
+  return renderFamily(familyState(), viewHelpers)
+    + '<div class="family-footer"><button class="btn btn-outline" data-show-sync-status>Tijek sinkronizacije</button><button class="text-button" data-goto="pregled">Pregled potrošnje</button></div>';
 }
 
 function renderPairingDialog(): string {
-  if (!model.pairingOpen) return "";
-  const family = model.pairingRole === "family_member";
-  const selected = (model.draftMemberLists ?? "").split(",").filter(Boolean);
-  const ps = model.pairStatus;
-  const isLan = model.pairMode === "lan";
-
-  if (isLan) {
-    const discoverable = model.lanPeersDiscovered.filter((p) => (p.pairPort ?? 0) > 0);
-    return `<div class="modal-backdrop"><section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="pairing-title"><div class="row space-between"><h2 id="pairing-title">Dodaj uređaj ili člana</h2><button class="icon-button" data-close-dialog aria-label="Odustani od dodavanja" ${model.pairingBusy ? "disabled" : ""}>${icon("close")}</button></div>
-      <div class="row-wrap"><button class="btn btn-primary" data-pair-mode="lan">Preko mreže (TLS 1.3)</button><button class="btn btn-outline" data-pair-mode="offline">Ručna evidencija</button></div>
-      ${ps?.pending ? `
-        <p class="item-sub">Usporedite ovaj 6-znamenkasti kod na oba uređaja prije potvrde:</p>
-        <div class="sas-code" aria-label="Kod za usporedbu">${escapeHtml(ps.sas ?? "—")}</div>
-        <div class="highlight-box"><strong>${escapeHtml(ps.peer_name || "Nepoznati uređaj")}</strong><div class="item-sub">Adresa: ${escapeHtml(ps.peer_host ?? "—")}</div><div class="item-sub">Ključ: <code>${escapeHtml((ps.peer_public_key ?? "").slice(0, 18))}…</code></div></div>
-        <label class="field">Pristup podacima<select id="sel-member-role" ${model.pairingBusy ? "disabled" : ""}><option value="family_member" ${family ? "selected" : ""}>Član obitelji · odabrani popisi</option><option value="own_device" ${family ? "" : "selected"}>Moj uređaj · svi moji podaci</option></select></label>
-        ${family ? `<fieldset class="list-choices"><legend>Popisi za dijeljenje</legend>${model.lists.length ? model.lists.map(l => `<label class="check-option"><input type="checkbox" data-pair-list="${escapeHtml(l.sync_id)}" ${selected.includes(l.sync_id) ? "checked" : ""} ${model.pairingBusy ? "disabled" : ""} /><span>${escapeHtml(l.name)}</span></label>`).join("") : '<p class="item-sub">Kreirajte popis prije dodavanja člana obitelji.</p>'}</fieldset>` : '<p class="item-sub">Ovaj uređaj moći će primati i osobne račune, katalog i sve popise.</p>'}
-        <label class="check-option"><input id="pairing-confirmed" type="checkbox" ${model.pairingConfirmed ? "checked" : ""} ${model.pairingBusy ? "disabled" : ""} /><span>Kod je jednak na oba uređaja.</span></label>
-        <div class="dialog-actions"><button class="btn btn-outline" id="btn-reject-live-pairing" ${model.pairingBusy ? "disabled" : ""}>Odbij</button><button class="btn btn-primary" id="btn-confirm-live-pairing" ${!model.pairingConfirmed || model.pairingBusy || (family && !selected.length) ? "disabled" : ""}>${model.pairingBusy ? "Potvrđivanje…" : "Potvrdi i upari"}</button></div>
-      ` : `
-        <label class="field">Naziv ovog uređaja<input id="inp-device-name" value="${escapeHtml(model.draftDeviceName)}" placeholder="Npr. Tomislav · MacBook" ${model.pairingBusy ? "disabled" : ""} /></label>
-        <div class="row-wrap">
-          ${ps?.waiting
-            ? `<button class="btn btn-outline" id="btn-stop-pair-listen" ${model.pairingBusy ? "disabled" : ""}>Zaustavi čekanje (port ${ps.listen_port ?? "?"})</button>`
-            : `<button class="btn btn-outline" id="btn-start-pair-listen" ${model.pairingBusy ? "disabled" : ""}>Čekaj uparivanje na ovom uređaju</button>`}
-          <button class="btn btn-outline" id="btn-discover-pair-peers" ${model.pairingBusy ? "disabled" : ""}>Pronađi na LAN-u</button>
-        </div>
-        ${ps?.waiting ? `<p class="item-sub" role="status">Uređaj čeka partnera na portu <strong>${ps.listen_port ?? "?"}</strong>…</p>` : ""}
-        ${discoverable.length ? `<div class="list-choices">${discoverable.map(p => `<div class="row space-between"><span><strong>${escapeHtml(p.name)}</strong> (${escapeHtml(p.addr)}:${p.pairPort})</span><button class="btn btn-primary" data-dial-discovered="${escapeHtml(`${p.addr}:${p.pairPort}`)}" ${model.pairingBusy ? "disabled" : ""}>Spoji se</button></div>`).join("")}</div>` : ""}
-        <div class="row-wrap"><label class="field grow">Adresa drugog uređaja (IP:port)<input id="inp-pair-addr" value="${escapeHtml(model.draftPairAddr)}" placeholder="192.168.1.25:45123" ${model.pairingBusy ? "disabled" : ""} /></label><button class="btn btn-primary" id="btn-dial-pair" ${model.pairingBusy ? "disabled" : ""}>Spoji se</button></div>
-        ${ps?.error ? `<p class="item-sub error-inline">${escapeHtml(ps.error)}</p>` : ""}
-      `}
-    </section></div>`;
-  }
-
-  return `<div class="modal-backdrop"><section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="pairing-title"><div class="row space-between"><h2 id="pairing-title">Dodaj uređaj ili člana</h2><button class="icon-button" data-close-dialog aria-label="Odustani od dodavanja" ${model.pairingBusy ? "disabled" : ""}>${icon("close")}</button></div>
-    <div class="row-wrap"><button class="btn btn-outline" data-pair-mode="lan">Preko mreže (TLS 1.3)</button><button class="btn btn-primary" data-pair-mode="offline">Ručna evidencija</button></div>
-    <p class="item-sub">Usporedite kod s drugim uređajem prije dodavanja u evidenciju za razmjenu paketa.</p>
-    <div class="sas-code" aria-label="Kod za usporedbu">${escapeHtml(model.pendingSasCode)}</div>
-    <label class="field">Naziv uređaja ili osobe<input id="inp-member-name" value="${escapeHtml(model.draftMemberName)}" placeholder="Npr. Ana · iPhone" ${model.pairingBusy ? "disabled" : ""} /></label>
-    <label class="field">Pristup podacima<select id="sel-member-role" ${model.pairingBusy ? "disabled" : ""}><option value="family_member" ${family ? "selected" : ""}>Član obitelji · odabrani popisi</option><option value="own_device" ${family ? "" : "selected"}>Moj uređaj · svi moji podaci</option></select></label>
-    ${family ? `<fieldset class="list-choices"><legend>Popisi za dijeljenje</legend>${model.lists.length ? model.lists.map(l => `<label class="check-option"><input type="checkbox" data-pair-list="${escapeHtml(l.sync_id)}" ${selected.includes(l.sync_id) ? "checked" : ""} ${model.pairingBusy ? "disabled" : ""} /><span>${escapeHtml(l.name)}</span></label>`).join("") : '<p class="item-sub">Kreirajte popis prije dodavanja člana obitelji.</p>'}</fieldset><p class="item-sub">Osobni računi nisu dio obiteljskog paketa.</p>` : '<div class="highlight-box"><p>Ovaj uređaj moći će primati i osobne račune, katalog i sve popise.</p></div>'}
-    <label class="check-option"><input id="pairing-confirmed" type="checkbox" ${model.pairingConfirmed ? "checked" : ""} ${model.pairingBusy ? "disabled" : ""} /><span>Kod je jednak na oba uređaja.</span></label>
-    <div class="dialog-actions"><button class="btn btn-outline" id="btn-reject-pairing" ${model.pairingBusy ? "disabled" : ""}>Ne podudara se</button><button class="btn btn-primary" id="btn-add-member" ${!model.pairingConfirmed || model.pairingBusy || (family && !selected.length) ? "disabled" : ""}>${model.pairingBusy ? "Spremanje…" : "Potvrdi i dodaj"}</button></div></section></div>`;
+  return renderPairingView(model, viewHelpers);
 }
 
 function renderMemberDialog(): string {
-  const m = model.removalMember ?? model.accessMember;
-  if (!m) return "";
-  if (model.removalMember) return `<div class="modal-backdrop"><section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="member-title"><h2 id="member-title">Ukloni iz evidencije?</h2><p>${escapeHtml(m.name)}</p><p class="item-sub">Ovaj se uređaj ili član uklanja iz lokalne evidencije. Već poslane datoteke i podaci na drugim uređajima ostaju kod primatelja.</p><div class="dialog-actions"><button class="btn btn-outline" data-close-dialog>Odustani</button><button class="btn btn-danger" data-remove-member="${escapeHtml(m.peer_id)}">Ukloni</button></div></section></div>`;
-  const names = m.role === "own_device" ? ["Svi moji računi, katalog i popisi"] : sharedListNames(m.shared_lists, model.lists);
-  return `<div class="modal-backdrop"><section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="member-title"><div class="row space-between"><h2 id="member-title">Pristup podacima</h2><button class="icon-button" data-close-dialog aria-label="Zatvori pregled pristupa">${icon("close")}</button></div><strong>${escapeHtml(m.name)}</strong><p class="item-sub">${m.role === "own_device" ? "Moj uređaj" : "Član obitelji"} · dodan ${escapeHtml(formatDate(m.added_at))}</p><ul class="access-list">${names.map(name => `<li>${escapeHtml(name)}</li>`).join("")}</ul><p class="item-sub">${m.role === "family_member" ? "Ovo je odabir popisa za razmjenu paketa. Osobni računi ostaju privatni." : "Osobni paket uključuje sve vaše podatke."}</p><div class="dialog-actions"><button class="btn btn-danger-ghost" id="btn-review-remove-member">Ukloni iz evidencije</button><button class="btn btn-primary" data-close-dialog>Zatvori</button></div></section></div>`;
+  return renderMemberView(familyState(), viewHelpers);
 }
 
 function renderAdvanced(): string {
@@ -785,22 +703,7 @@ function conflictLabel(group: IdentityConflict, id: string): string {
 }
 
 function renderIdentityConflicts(): string {
-  const review = model.conflictReview;
-  return `<section class="card" aria-label="Duplikati zapisa">
-    <div class="row space-between"><h2>Duplikati zapisa${model.conflicts.length ? ` (${model.conflicts.length})` : ""}</h2>
-    <button class="btn btn-outline" id="refresh-conflicts" ${model.resolvingConflict ? "disabled" : ""}>Osvježi</button></div>
-    ${review ? `<h3>Potvrdi odabir</h3>
-      <p>Aktivan ostaje: <strong>${escapeHtml(conflictLabel(review.group, review.keepId))}</strong></p>
-      <p>Arhivirat će se:</p><ul>${review.group.sync_ids.filter(id => id !== review.keepId).map(id => `<li>${escapeHtml(conflictLabel(review.group,id))} <small>${escapeHtml(id)}</small></li>`).join("")}</ul>
-      <p>Izvorni zapisi, povijest cijena i računi ostaju sačuvani s postojećim vezama. Polja se ne prepisuju niti se povijest premješta na odabrani zapis.</p>
-      <button class="btn btn-primary" id="confirm-conflict" ${model.resolvingConflict ? "disabled" : ""}>${model.resolvingConflict ? "Spremanje…" : "Potvrdi i arhiviraj duplikate"}</button>
-      <button class="btn btn-outline" id="cancel-conflict" ${model.resolvingConflict ? "disabled" : ""}>Odustani</button>`
-    : model.conflicts.length ? `<p>Odaberi zapis koji želiš koristiti ubuduće. Prije spremanja možeš pregledati odabir.</p>
-      ${model.conflicts.map((group,index) => `<div class="card"><h3>${group.entity === "stores" ? "Trgovine istog naziva" : "Artikli istog barkoda"}: ${escapeHtml(group.value)}</h3>
-      ${group.sync_ids.map(id => `<div class="row space-between"><div><strong>${escapeHtml(conflictLabel(group,id))}</strong><div><small>${escapeHtml(id)}</small></div></div>
-      <button class="btn btn-outline" data-conflict-group="${index}" data-conflict-keep="${escapeHtml(id)}">Zadrži ovaj zapis</button></div>`).join("")}</div>`).join("")}`
-    : "<p>Nema nerazriješenih duplikata.</p>"}
-  </section>`;
+  return renderConflictView(model, viewHelpers, conflictLabel);
 }
 
 async function refreshConflictData(): Promise<void> {
@@ -940,14 +843,7 @@ function bindRetailSearch():void {
 }
 
 function renderSyncProgress(): string {
-  const p = syncTracker.progress;
-  if (!p) return "";
-  return `<section class="card" aria-busy="${p.state === "running"}">
-    <h2>${escapeHtml(p.title)} · ${p.state === "running" ? "U tijeku" : p.state === "done" ? "Dovršeno" : "Zaustavljeno greškom"}</h2>
-    <ol>${p.steps.map((label,index) => `<li>${index < p.completed ? "✓" : index === p.current ? (p.state === "error" ? "✕" : "…") : "○"} ${escapeHtml(label)}${index === p.current && p.state === "running" ? " — u tijeku" : ""}</li>`).join("")}</ol>
-    ${p.detail ? `<p>${escapeHtml(p.detail)}</p>` : ""}
-    <small>Posljednja promjena: ${escapeHtml(new Date(p.updatedAt).toLocaleTimeString("hr-HR"))}</small>
-  </section>`;
+  return renderProgressView(syncTracker.progress, viewHelpers);
 }
 
 function offerPackageDownload(json: string, prefix: string): void {
@@ -1002,6 +898,9 @@ function render(): void {
     case "sync":
       content = renderSync();
       break;
+    case "about":
+      content = renderAbout(appMetadata, viewHelpers);
+      break;
     case "napredno":
       content = renderAdvanced();
       break;
@@ -1011,13 +910,15 @@ function render(): void {
     <div class="app-shell">
       ${renderSidebar()}
       <main class="main-content">
+          ${renderProductTabs(model.tab)}
           ${model.retailOpen && ["kosarica", "planer", "katalog", "cijene"].includes(model.tab) ? renderRetailSearch() : ""}
-          <div role="status" aria-live="polite" aria-atomic="true">${renderSyncProgress()}</div>
+          <div role="status" aria-live="polite" aria-atomic="true">${model.tab === "sync" && syncDetailsOpen ? "" : renderSyncProgress()}</div>
           ${model.incompleteReceipts ? `<div class="card" role="status">Računi koji čekaju dovršetak prijenosa: ${model.incompleteReceipts}. Prikazat će se kada stignu sve potvrđene stavke i zbrojevi budu usklađeni.</div>` : ""}
           ${(model.conflicts.length || model.conflictReview) && model.tab !== "napredno" ? renderIdentityConflicts() : ""}
         ${content}
       </main>
     </div>
+    ${editingCartItemId && model.cart.find(item => item.id === editingCartItemId) ? renderCartEditor(model.cart.find(item => item.id === editingCartItemId)!, escapeHtml) : ""}
     ${renderReceiptDialog()}
     ${renderPairingDialog()}
     ${renderMemberDialog()}
@@ -1138,6 +1039,66 @@ function startVideoBarcodeDetection(video: HTMLVideoElement): void {
 }
 
 function bindEvents(): void {
+  document.querySelectorAll<HTMLButtonElement>("[data-show-sync-status]").forEach(button => {
+    button.onclick = () => { syncDetailsOpen = true; model.tab = "sync"; render(); };
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-open-list]").forEach(button => {
+    button.onclick = () => {
+      const id = Number(button.dataset.openList);
+      if (!model.lists.some(list => list.id === id)) return;
+      model.selectedListId = id;
+      render();
+    };
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-edit-cart]").forEach(button => {
+    button.onclick = () => {
+      editingCartItemId = button.dataset.editCart ?? null;
+      render();
+      document.getElementById("cart-edit-quantity")?.focus();
+    };
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-cancel-cart-edit]").forEach(button => {
+    button.onclick = () => { editingCartItemId = null; render(); };
+  });
+  const editor = document.getElementById("cart-edit-form") as HTMLFormElement | null;
+  if (editor) {
+    const readEdit = () => {
+      const item = model.cart.find(item => item.id === editingCartItemId);
+      return item ? editCartItem(item, {
+        quantity: (document.getElementById("cart-edit-quantity") as HTMLInputElement).value,
+        unit: (document.getElementById("cart-edit-unit") as HTMLSelectElement).value as Unit,
+        price: (document.getElementById("cart-edit-price") as HTMLInputElement).value,
+      }) : null;
+    };
+    editor.oninput = () => {
+      const result = readEdit();
+      const total = document.getElementById("cart-edit-total");
+      if (total) total.textContent = result?.ok ? formatCents(result.item.total_cents) : "—";
+    };
+    editor.onsubmit = event => {
+      event.preventDefault();
+      const result = readEdit();
+      if (!result) return;
+      if (!result.ok) {
+        const error = document.getElementById("cart-edit-error");
+        if (error) error.textContent = result.error;
+        return;
+      }
+      model.cart = model.cart.map(item => item.id === editingCartItemId ? result.item : item);
+      editingCartItemId = null;
+      render();
+    };
+  }
+  document.querySelectorAll<HTMLButtonElement>("[data-fs-open-pairing]").forEach(button => {
+    button.onclick = async () => {
+      model.pairingAdmit = false;
+      model.pairMode = "lan";
+      model.pairingOpen = true;
+      model.pairingConfirmed = false;
+      model.pairStatus = await getPairStatus().catch(() => null);
+      render();
+    };
+  });
   bindRetailSearch();
   const busy = syncTracker.progress?.state === "running";
   for (const id of ["btn-export-bundle", "btn-export-family-bundle", "inp-import-bundle"]) {
@@ -1177,6 +1138,7 @@ function bindEvents(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((btn) => {
     btn.onclick = () => {
       const nextTab = btn.dataset.tab as Tab;
+      if (nextTab === "sync") syncDetailsOpen = false;
       model.tab = nextTab;
       if (nextTab === "cijene" && !model.comparisonLoaded && !model.comparisonBusy) {
         void refreshComparisons();
@@ -1189,6 +1151,7 @@ function bindEvents(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-goto]").forEach((btn) => {
     btn.onclick = () => {
       const nextTab = btn.dataset.goto as Tab;
+      if (nextTab === "sync") syncDetailsOpen = false;
       if (nextTab === "cijene" && model.tab === "planer") {
         const list = currentList();
         model.comparisonSource = list ? `list:${list.id}` : "cart";
@@ -1213,10 +1176,12 @@ function bindEvents(): void {
   });
 
   document.querySelectorAll<HTMLButtonElement>("[data-close-dialog]").forEach((btn) => {
-    btn.onclick = () => {
-      if (model.pairingBusy) return;
+    btn.onclick = async () => {
+      if (model.pairingOpen) {
+        await cancelPairing();
+        return;
+      }
       model.selectedReceipt = null;
-      model.pairingOpen = false;
       model.accessMember = null;
       model.removalMember = null;
       render();
@@ -1744,6 +1709,16 @@ function bindEvents(): void {
     };
   });
 
+  document.querySelectorAll<HTMLButtonElement>("[data-remove-plan]").forEach((btn) => {
+    btn.onclick = async () => {
+      const syncId = btn.dataset.removePlan;
+      if (!syncId) return;
+      await removePlannedItem(syncId);
+      model.lists = await listShoppingLists();
+      render();
+    };
+  });
+
   const btnTransferCart = document.getElementById("btn-transfer-cart");
   if (btnTransferCart && activePlanList) {
     btnTransferCart.onclick = () => {
@@ -1914,10 +1889,18 @@ function bindEvents(): void {
       render();
     };
   }
+  const selPairDirection = document.getElementById("sel-pair-direction") as HTMLSelectElement | null;
+  if (selPairDirection) {
+    selPairDirection.onchange = () => {
+      model.pairingAdmit = selPairDirection.value === "admit";
+      render();
+    };
+  }
 
   const btnOpenPairing = document.getElementById("btn-open-pairing");
   if (btnOpenPairing) {
     btnOpenPairing.onclick = async () => {
+      model.pairingAdmit = true;
       model.pairingOpen = true;
       model.pairingConfirmed = false;
       if (model.draftMemberLists === null) {
@@ -1966,8 +1949,9 @@ function bindEvents(): void {
         stopPairPoll();
         return;
       }
+      const operation = pairingOperation;
       const next = await getPairStatus().catch(() => null);
-      if (!next) return;
+      if (!next || operation !== pairingOperation || !model.pairingOpen || model.pairingAction === "cancelling") return;
       const changed =
         next.pending !== model.pairStatus?.pending ||
         next.waiting !== model.pairStatus?.waiting ||
@@ -1984,6 +1968,7 @@ function bindEvents(): void {
   const btnStartPairListen = document.getElementById("btn-start-pair-listen");
   if (btnStartPairListen) {
     btnStartPairListen.onclick = async () => {
+      model.pairingAdmit = true;
       model.pairingBusy = true;
       render();
       try {
@@ -2030,6 +2015,7 @@ function bindEvents(): void {
 
   const startLiveDial = async (addr: string) => {
     if (!addr.trim()) return showToast("Unesite IP:port drugog uređaja.");
+    model.pairingAdmit = model.members.length > 0;
     model.pairingBusy = true;
     render();
     try {
@@ -2064,58 +2050,62 @@ function bindEvents(): void {
   if (btnConfirmLivePairing) {
     btnConfirmLivePairing.onclick = async () => {
       if (!model.pairingConfirmed || model.pairingBusy) return;
+      const canAdmit = model.pairStatus?.can_admit ?? false;
+      const admit = canAdmit && model.pairingAdmit;
       const role = ((selMemberRole?.value as PeerRole) ?? model.pairingRole) || "family_member";
       const sharedLists =
-        role === "own_device"
+        !admit || role === "own_device"
           ? "*"
           : (model.draftMemberLists ?? "").split(",").filter(Boolean).join(",");
-      if (role === "family_member" && !sharedLists) {
+      if (admit && role === "family_member" && !sharedLists) {
         return showToast("Odaberite barem jedan popis za dijeljenje.");
       }
+      const operation = ++pairingOperation;
       model.pairingBusy = true;
+      model.pairingAction = "confirming";
       render();
       try {
         const outcome = await confirmPairPeer({
           approved: true,
           role,
           sharedLists,
-          admit: model.pairStatus?.can_admit ?? true,
+          admit,
         });
+        if (operation !== pairingOperation) return;
         stopPairPoll();
-        model.pairStatus = await getPairStatus().catch(() => null);
+        const [status, members, lanStatus, ledgerStats] = await Promise.all([
+          getPairStatus().catch(() => null),
+          listNetworkMembers(),
+          getLanStatus().catch(() => model.lanStatus),
+          getLedgerStats().catch(() => model.ledgerStats),
+        ]);
+        if (operation !== pairingOperation) return;
+        model.pairStatus = status;
         model.pairingOpen = false;
         model.pairingConfirmed = false;
         model.draftMemberLists = null;
-        model.members = await listNetworkMembers();
-        model.lanStatus = await getLanStatus().catch(() => model.lanStatus);
+        model.members = members;
+        model.lanStatus = lanStatus;
+        model.ledgerStats = ledgerStats;
+        if (model.ledgerStats?.network_name) {
+          model.draftNetworkName = model.ledgerStats.network_name;
+        }
         showToast(outcome.message);
       } catch (e) {
-        showToast(`Greška potvrde uparivanja: ${e}`);
+        if (operation === pairingOperation) showToast(`Greška potvrde uparivanja: ${e}`);
       } finally {
-        model.pairingBusy = false;
-        render();
+        if (operation === pairingOperation) {
+          model.pairingBusy = false;
+          model.pairingAction = null;
+          render();
+        }
       }
     };
   }
 
   const btnRejectLivePairing = document.getElementById("btn-reject-live-pairing");
   if (btnRejectLivePairing) {
-    btnRejectLivePairing.onclick = async () => {
-      model.pairingBusy = true;
-      render();
-      try {
-        await confirmPairPeer({ approved: false });
-      } catch {
-        // Ignore error if peer already closed
-      } finally {
-        stopPairPoll();
-        model.pairStatus = await getPairStatus().catch(() => null);
-        model.pairingConfirmed = false;
-        model.pairingBusy = false;
-        render();
-        showToast("Uparivanje je odbijeno.");
-      }
-    };
+    btnRejectLivePairing.onclick = () => { void cancelPairing(); };
   }
 
   const btnLanStart = document.getElementById("btn-lan-start");

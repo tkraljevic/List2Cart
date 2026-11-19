@@ -25,7 +25,7 @@
 
   --radius-sm: 8px;
   --radius-btn: 10px;
-  --radius-card: 18px;
+  --radius-card: 14px;
 
   --font-stack: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Inter, Arial, sans-serif;
 }
@@ -41,19 +41,22 @@ body {
   background: var(--bg-body);
   color: var(--text-main);
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
+  line-height: 1.45;
   -webkit-font-smoothing: antialiased;
 }
 
 .app-shell {
   display: flex;
   height: 100vh;
+  height: 100dvh;
   width: 100vw;
 }
 
-/* Sidebar (PometiME style) */
+/* Shared desktop navigation */
 .sidebar {
-  width: 230px;
+  width: 210px;
   flex-shrink: 0;
   background: var(--glass-nav);
   backdrop-filter: blur(20px);
@@ -62,14 +65,14 @@ body {
   display: flex;
   flex-direction: column;
   padding: 20px 14px;
-  justify-content: space-between;
+  gap: 22px;
 }
 
 .brand-box {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 22px;
+  margin-bottom: 0;
   padding: 0 4px;
 }
 
@@ -87,7 +90,7 @@ body {
 }
 
 .brand-tag {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-muted);
 }
 
@@ -95,6 +98,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 5px;
+  flex: 1;
 }
 
 .nav-btn {
@@ -103,6 +107,7 @@ body {
   gap: 10px;
   width: 100%;
   padding: 9px 12px;
+  min-height: 44px;
   border: 1px solid transparent;
   border-radius: var(--radius-btn);
   background: transparent;
@@ -168,8 +173,10 @@ body {
 /* Main Content */
 .main-content {
   flex: 1;
+  min-width: 0;
+  min-height: 0;
   overflow-y: auto;
-  padding: 28px 34px;
+  padding: 24px;
   display: flex;
   flex-direction: column;
   gap: 18px;
@@ -216,7 +223,6 @@ body {
 }
 
 .back-link {
-  display: inline-flex;
   align-items: center;
   gap: 6px;
   background: transparent;
@@ -326,7 +332,10 @@ body {
 input,
 select {
   font-family: inherit;
-  font-size: 13px;
+  font-size: 14px;
+  min-height: 44px;
+  min-width: 0;
+  max-width: 100%;
   padding: 9px 12px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
@@ -347,7 +356,8 @@ select:focus {
   justify-content: center;
   gap: 7px;
   font-family: inherit;
-  font-size: 13px;
+  font-size: 14px;
+  min-height: 44px;
   font-weight: 600;
   padding: 9px 16px;
   border-radius: var(--radius-btn);
@@ -404,8 +414,8 @@ select:focus {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
+  width: 44px;
+  height: 44px;
   border-radius: var(--radius-sm);
   border: 1px solid transparent;
   background: transparent;
@@ -452,7 +462,8 @@ select:focus {
   display: flex;
   flex-direction: column;
   gap: 5px;
-  font-size: 12px;
+  font-size: 13px;
+  min-width: 0;
   font-weight: 600;
   color: var(--text-muted);
 }
@@ -460,6 +471,28 @@ select:focus {
 .field.grow {
   flex: 1;
   min-width: 150px;
+}
+
+.field input,
+.field select {
+  width: 100%;
+}
+
+button:focus-visible,
+summary:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 3px;
+}
+
+input[type="checkbox"] {
+  width: 22px;
+  height: 22px;
+  min-height: 22px;
+  flex-shrink: 0;
+  accent-color: var(--primary);
 }
 
 .action-card {
@@ -498,7 +531,7 @@ select:focus {
 
 .cart-inputs {
   display: grid;
-  grid-template-columns: 1.1fr 2fr 0.8fr 0.8fr 1fr;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 2fr) minmax(0, .8fr) minmax(0, .8fr) minmax(0, 1fr);
   gap: 10px;
 }
 
@@ -592,7 +625,7 @@ select:focus {
 }
 
 .caption {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-muted);
 }
 
@@ -604,6 +637,7 @@ select:focus {
 
 .plan-add > .row > input {
   flex: 1;
+  min-width: 0;
 }
 
 .plan-details summary {
@@ -998,7 +1032,7 @@ select:focus {
 }
 
 .item-sub {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-muted);
 }
 
@@ -1054,6 +1088,8 @@ select:focus {
   padding: 22px;
   width: 100%;
   max-width: 440px;
+  max-height: calc(100dvh - 40px);
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -1111,8 +1147,10 @@ select:focus {
   .mobile-nav {
     display: flex;
     order: 2;
+    flex-shrink: 0;
     width: 100%;
     padding: 8px;
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
     background: var(--glass-nav);
     backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
@@ -1124,7 +1162,8 @@ select:focus {
     flex-direction: column;
     gap: 3px;
     padding: 6px 8px;
-    font-size: 11px;
+    font-size: 12px;
+    min-height: 54px;
     text-align: center;
     justify-content: center;
   }
@@ -1132,14 +1171,70 @@ select:focus {
   .main-content {
     order: 1;
     padding: 16px;
+    padding-top: calc(16px + env(safe-area-inset-top));
     padding-bottom: 24px;
   }
 
   .grid-2,
   .cart-layout,
-  .plan-layout,
-  .cart-inputs {
+  .plan-layout {
     grid-template-columns: 1fr;
+  }
+
+  .page-header h1 {
+    font-size: 20px;
+  }
+
+  .card {
+    padding: 14px;
+  }
+
+  input,
+  select,
+  .btn {
+    min-height: 48px;
+  }
+
+  input,
+  select {
+    font-size: 16px;
+  }
+
+  .cart-inputs {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .field-barcode,
+  .field-name {
+    grid-column: span 3;
+  }
+
+  .field-qty,
+  .field-unit,
+  .field-price {
+    grid-column: span 2;
+  }
+
+  .entry-tools {
+    gap: 4px 14px;
+  }
+
+  .item-copy,
+  .device-row,
+  .member-row,
+  .technical-stats dd {
+    overflow-wrap: anywhere;
+  }
+
+  .device-row,
+  .member-row {
+    flex-wrap: wrap;
+  }
+
+  .toast {
+    bottom: calc(88px + env(safe-area-inset-bottom));
+    max-width: calc(100vw - 32px);
   }
 }
 
@@ -1158,4 +1253,59 @@ select:focus {
     overflow: visible;
     background: #ffffff;
   }
+
+  body:has(.receipt-dialog) .app-shell {
+    display: none;
+  }
+
+  .receipt-dialog {
+    position: static;
+    display: block;
+    padding: 0;
+    background: #ffffff;
+  }
+
+  .receipt-dialog .modal-card,
+  .receipt-lines {
+    max-height: none;
+    max-width: none;
+    overflow: visible;
+    box-shadow: none;
+  }
 }
+
+/* Alpha design: shared product navigation and five mobile destinations. */
+.product-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 6px;
+  margin-bottom: 20px;
+  border-radius: var(--radius-card);
+  background: var(--primary-subtle);
+}
+.product-tabs .btn { flex: 1; min-width: 0; }
+.brand-logo { object-fit: contain; }
+@media (max-width: 768px) {
+  .mobile-nav .nav-btn {
+    flex: 1 1 0;
+    min-width: 0;
+    padding-inline: 2px;
+    font-size: 11px;
+  }
+}
+
+/* Approved alpha palette and cart editing. */
+:root { --primary: #1766d9; --text-main: #192d4d; --text-muted: #586c88; --bg-body: #f5f7fb; --border: #dce4ef; --primary-subtle: #eaf1fc; }
+.sidebar { background: #fff; width: 204px; }
+.nav-btn.active { background: var(--primary-subtle); border-color: transparent; box-shadow: none; }
+.cart-edit-trigger { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; font-weight: 700; }
+.cart-edit-trigger span { font-size: 12px; font-weight: 400; }
+.commerce-editor form { display: flex; flex-direction: column; gap: 16px; }
+.commerce-editor input, .commerce-editor select { width: 100%; }
+
+.commerce-lists { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-bottom: 20px; }
+.commerce-list-card { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; text-align: left; cursor: pointer; color: var(--text-main); font: inherit; min-width: 0; }
+.commerce-list-card.is-selected { border-color: var(--primary); box-shadow: 0 0 0 1px var(--primary); }
+.commerce-list-card strong { font-size: 20px; }
+.commerce-list-preview { overflow-wrap: anywhere; line-height: 1.5; }
+@media (max-width: 768px) { .commerce-lists { grid-template-columns: 1fr; } }
